@@ -1,0 +1,43 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "XTB Investments",
+        "description": "Connect a read-only Home Assistant integration to XTB xStation5 through an unofficial API client.",
+        "data": {
+          "email": "Login",
+          "password": "Password",
+          "otp": "OTP"
+        }
+      }
+    }
+  },
+  "entity": {
+    "sensor": {
+      "portfolio": {
+        "name": "Portfolio"
+      },
+      "balance": {
+        "name": "Balance"
+      },
+      "free_margin": {
+        "name": "Free margin"
+      },
+      "open_profit_net": {
+        "name": "Open profit"
+      },
+      "open_profit_percent": {
+        "name": "Open profit percent"
+      },
+      "open_positions": {
+        "name": "Open positions"
+      },
+      "pending_orders": {
+        "name": "Pending orders"
+      },
+      "quote": {
+        "name": "{symbol}"
+      }
+    }
+  }
+}

@@ -1,0 +1,400 @@
+"""Local HTTP bridge for XTB xStation5.
+
+The Home Assistant integration intentionally does not install Chromium. This add-on
+does that in its own container and exposes a small localhost API.
+"""
+
+from __future__ import annotations
+
+import asyncio
+from dataclasses import asdict, is_dataclass
+from datetime import UTC, datetime
+import hashlib
+import json
+import logging
+import os
+from pathlib import Path
+from typing import Any
+
+from aiohttp import web
+
+from xtb_api import XTBClient
+
+DATA_DIR = Path(os.environ.get("XTB_BRIDGE_DATA", "/data"))
+SESSION_DIR = DATA_DIR / "sessions"
+DEFAULT_PORT = 8765
+
+logging.basicConfig(
+    level=os.environ.get("LOG_LEVEL", "INFO"),
+    format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
+)
+LOGGER = logging.getLogger("xtb_bridge")
+
+
+class ManagedClient:
+    """A cached XTB client with automatic account-number discovery."""
+
+    def __init__(self, *, email: str, password: str, otp: str) -> None:
+        self.email = email
+        self.password = password
+        self.otp = otp
+        self.account_number: int | None = None
+        self.client: XTBClient | None = None
+        self.lock = asyncio.Lock()
+        self.session_file = SESSION_DIR / f"{_cache_key(email, password, otp)}.json"
+
+    async def get_snapshot(self) -> dict[str, Any]:
+        async with self.lock:
+            client = await self._get_client()
+            return await _snapshot(client)
+
+    async def _get_client(self) -> XTBClient:
+        if self.client and self.client.is_connected and self.client.is_authenticated:
+            return self.client
+
+        await self.close()
+        if self.account_number is None:
+            self.account_number = await self._discover_account_number()
+
+        self.client = XTBClient(
+            email=self.email,
+            password=self.password,
+            account_number=self.account_number,
+            account_type="real",
+            totp_secret=self.otp,
+            session_file=self.session_file,
+        )
+        await self.client.connect()
+        return self.client
+
+    async def _discover_account_number(self) -> int:
+        LOGGER.info("Discovering XTB account number for %s", self.email)
+        probe = XTBClient(
+            email=self.email,
+            password=self.password,
+            account_number=0,
+            account_type="real",
+            totp_secret=self.otp,
+            session_file=self.session_file,
+        )
+        try:
+            await probe.connect()
+            account_number = int(probe.ws.get_account_number())
+            if account_number <= 0:
+                raise RuntimeError("XTB login succeeded but no account number was returned")
+            LOGGER.info("Discovered XTB account number %s for %s", account_number, self.email)
+            return account_number
+        finally:
+            await probe.disconnect()
+
+    async def close(self) -> None:
+        if self.client is None:
+            return
+        try:
+            await self.client.disconnect()
+        finally:
+            self.client = None
+
+
+CLIENTS: dict[str, ManagedClient] = {}
+
+
+async def health(_request: web.Request) -> web.Response:
+    return web.json_response({"ok": True})
+
+
+async def snapshot(request: web.Request) -> web.Response:
+    try:
+        payload = await request.json()
+    except json.JSONDecodeError:
+        return web.json_response({"error": "Invalid JSON"}, status=400)
+
+    email = str(payload.get("email") or "").strip()
+    password = str(payload.get("password") or "")
+    otp = str(payload.get("otp") or "").replace(" ", "")
+
+    if not email or not password:
+        return web.json_response({"error": "Email and password are required"}, status=400)
+
+    key = _cache_key(email, password, otp)
+    client = CLIENTS.get(key)
+    if client is None:
+        client = ManagedClient(email=email, password=password, otp=otp)
+        CLIENTS[key] = client
+
+    try:
+        data = await client.get_snapshot()
+    except Exception as err:  # noqa: BLE001 - bridge must return actionable errors
+        LOGGER.exception("Snapshot failed for %s", email)
+        await client.close()
+        return web.json_response({"error": str(err)}, status=502)
+
+    return web.json_response(data)
+
+
+async def _snapshot(client: XTBClient) -> dict[str, Any]:
+    balance_raw = await client.get_balance()
+    positions_raw = await client.get_positions()
+    orders_raw = await client.get_orders()
+
+    account = _normalize_account(balance_raw)
+    positions = [_normalize_position(position) for position in positions_raw]
+    orders = [_normalize_order(order) for order in orders_raw]
+
+    symbols = sorted(
+        {
+            *(position["symbol"] for position in positions if position.get("symbol")),
+            *(order["symbol"] for order in orders if order.get("symbol")),
+        }
+    )
+
+    quotes: dict[str, dict[str, Any]] = {}
+    for symbol in symbols:
+        try:
+            quote = await client.get_quote(symbol)
+            quotes[symbol] = _normalize_quote(symbol, quote)
+        except Exception as err:  # noqa: BLE001
+            LOGGER.debug("Unable to fetch quote for %s: %s", symbol, err)
+            quotes[symbol] = {"symbol": symbol, "available": False, "error": str(err)}
+
+    return {
+        "account": account,
+        "summary": _build_summary(account, positions, orders, quotes),
+        "positions": positions,
+        "orders": orders,
+        "quotes": quotes,
+        "session": _normalize_session(client),
+        "updated_at": datetime.now(UTC).isoformat(),
+    }
+
+
+def _normalize_account(raw: Any) -> dict[str, Any]:
+    data = _to_dict(raw)
+    return {
+        "account_number": _int(data.get("account_number")),
+        "balance": _float(data.get("balance")),
+        "equity": _float(data.get("equity")),
+        "free_margin": _float(data.get("free_margin")),
+        "currency": data.get("currency") or "",
+    }
+
+
+def _normalize_position(raw: Any) -> dict[str, Any]:
+    data = _to_dict(raw)
+    symbol = str(data.get("symbol") or "").upper()
+    current_price = _float(data.get("current_price")) or 0.0
+    open_price = _float(data.get("open_price")) or 0.0
+    price_change = current_price - open_price if current_price and open_price else None
+    price_change_percent = (
+        (price_change / open_price) * 100 if price_change is not None and open_price else None
+    )
+
+    return {
+        "symbol": symbol,
+        "side": data.get("side"),
+        "volume": _float(data.get("volume")) or 0.0,
+        "current_price": current_price,
+        "open_price": open_price,
+        "price_change": _rounded(price_change),
+        "price_change_percent": _rounded(price_change_percent),
+        "profit_net": _float(data.get("profit_net")) or 0.0,
+        "profit_percent": _float(data.get("profit_percent")) or 0.0,
+        "stop_loss": _float(data.get("stop_loss")),
+        "take_profit": _float(data.get("take_profit")),
+        "swap": _float(data.get("swap")),
+        "commission": _float(data.get("commission")),
+        "margin": _float(data.get("margin")),
+        "order_id": data.get("order_id"),
+        "instrument_id": _int(data.get("instrument_id")),
+        "open_time": data.get("open_time"),
+    }
+
+
+def _normalize_order(raw: Any) -> dict[str, Any]:
+    data = _to_dict(raw)
+    return {
+        "symbol": str(data.get("symbol") or "").upper(),
+        "side": data.get("side"),
+        "volume": _float(data.get("volume")) or 0.0,
+        "price": _float(data.get("price")) or 0.0,
+        "stop_loss": _float(data.get("stop_loss")),
+        "take_profit": _float(data.get("take_profit")),
+        "order_id": data.get("order_id"),
+        "order_type": data.get("order_type"),
+        "instrument_id": _int(data.get("instrument_id")),
+        "expiration": data.get("expiration"),
+        "open_time": data.get("open_time"),
+    }
+
+
+def _normalize_quote(symbol: str, raw: Any) -> dict[str, Any]:
+    if raw is None:
+        return {"symbol": symbol.upper(), "available": False}
+
+    data = _to_dict(raw)
+    bid = _float(data.get("bid"))
+    ask = _float(data.get("ask"))
+    mid = ((bid + ask) / 2) if bid is not None and ask is not None else None
+    spread = _float(data.get("spread"))
+    if spread is None and bid is not None and ask is not None:
+        spread = ask - bid
+
+    previous = _first_float(data, "previous_close", "prev_close", "close", "open")
+    daily_change = _first_float(data, "daily_change", "change")
+    if daily_change is None and mid is not None and previous:
+        daily_change = mid - previous
+
+    daily_change_percent = _first_float(data, "daily_change_percent", "change_percent")
+    if daily_change_percent is None and daily_change is not None and previous:
+        daily_change_percent = (daily_change / previous) * 100
+
+    return {
+        "symbol": str(data.get("symbol") or symbol).upper(),
+        "available": True,
+        "bid": bid,
+        "ask": ask,
+        "mid": _rounded(mid),
+        "spread": _rounded(spread),
+        "spread_percent": _rounded((spread / mid) * 100 if spread is not None and mid else None),
+        "high": _float(data.get("high")),
+        "low": _float(data.get("low")),
+        "previous": previous,
+        "daily_change": _rounded(daily_change),
+        "daily_change_percent": _rounded(daily_change_percent),
+        "time": data.get("time"),
+    }
+
+
+def _normalize_session(client: XTBClient) -> dict[str, Any]:
+    expires_at = getattr(client, "session_expires_at", None)
+    expires_at_iso = None
+    if isinstance(expires_at, int | float):
+        expires_at_iso = datetime.fromtimestamp(expires_at, UTC).isoformat()
+
+    source = getattr(client, "session_source", None)
+    return {
+        "connected": bool(getattr(client, "is_connected", False)),
+        "authenticated": bool(getattr(client, "is_authenticated", False)),
+        "source": str(source) if source is not None else None,
+        "expires_at": expires_at_iso,
+        "account_number": getattr(client, "account_number", None),
+    }
+
+
+def _build_summary(
+    account: dict[str, Any],
+    positions: list[dict[str, Any]],
+    orders: list[dict[str, Any]],
+    quotes: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    balance = account.get("balance") or 0.0
+    equity = account.get("equity") or 0.0
+    free_margin = account.get("free_margin") or 0.0
+    used_margin = max(equity - free_margin, 0.0) if equity else 0.0
+    open_profit_net = sum(position.get("profit_net") or 0.0 for position in positions)
+    open_profit_percent = ((equity - balance) / balance) * 100 if balance else None
+    quote_values = [quote for quote in quotes.values() if quote.get("available")]
+    daily_changes = [
+        quote["daily_change_percent"]
+        for quote in quote_values
+        if quote.get("daily_change_percent") is not None
+    ]
+
+    return {
+        "account_number": account.get("account_number"),
+        "currency": account.get("currency") or "",
+        "balance": _rounded(balance),
+        "equity": _rounded(equity),
+        "free_margin": _rounded(free_margin),
+        "used_margin": _rounded(used_margin),
+        "margin_level_percent": _rounded((equity / used_margin) * 100 if used_margin else None),
+        "open_positions": len(positions),
+        "pending_orders": len(orders),
+        "open_profit_net": _rounded(open_profit_net),
+        "open_profit_percent": _rounded(open_profit_percent),
+        "quotes_available": len(quote_values),
+        "average_daily_change_percent": _rounded(
+            sum(daily_changes) / len(daily_changes) if daily_changes else None
+        ),
+    }
+
+
+def _to_dict(value: Any) -> dict[str, Any]:
+    if value is None:
+        return {}
+    if isinstance(value, dict):
+        return dict(value)
+    if hasattr(value, "model_dump"):
+        return value.model_dump(mode="json")
+    if is_dataclass(value):
+        return asdict(value)
+    return {
+        key: attr
+        for key in dir(value)
+        if not key.startswith("_") and not callable(attr := getattr(value, key))
+    }
+
+
+def _float(value: Any) -> float | None:
+    if value is None or value == "":
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _int(value: Any) -> int | None:
+    if value is None or value == "":
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _first_float(data: dict[str, Any], *keys: str) -> float | None:
+    for key in keys:
+        value = _float(data.get(key))
+        if value is not None:
+            return value
+    return None
+
+
+def _rounded(value: float | None, precision: int = 4) -> float | None:
+    if value is None:
+        return None
+    return round(value, precision)
+
+
+def _cache_key(*parts: str) -> str:
+    digest = hashlib.sha256()
+    for part in parts:
+        digest.update(part.encode("utf-8"))
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
+def _port() -> int:
+    options_file = DATA_DIR / "options.json"
+    if options_file.exists():
+        try:
+            options = json.loads(options_file.read_text(encoding="utf-8"))
+            return int(options.get("port", DEFAULT_PORT))
+        except Exception as err:  # noqa: BLE001
+            LOGGER.warning("Unable to read add-on options: %s", err)
+    return int(os.environ.get("PORT", DEFAULT_PORT))
+
+
+def main() -> None:
+    SESSION_DIR.mkdir(parents=True, exist_ok=True)
+    app = web.Application()
+    app.router.add_get("/health", health)
+    app.router.add_post("/snapshot", snapshot)
+    port = _port()
+    LOGGER.info("Starting XTB Bridge on 0.0.0.0:%s", port)
+    web.run_app(app, host="0.0.0.0", port=port)
+
+
+if __name__ == "__main__":
+    main()

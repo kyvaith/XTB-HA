@@ -1,0 +1,20 @@
+name: XTB Bridge
+version: "0.1.0"
+slug: xtb_bridge
+description: Local Chromium bridge for XTB Investments Home Assistant integration
+url: "https://github.com/kyvaith/XTB-HA/tree/main/addons/xtb_bridge"
+arch:
+  - amd64
+  - aarch64
+startup: services
+boot: auto
+init: false
+host_network: true
+ports:
+  8765/tcp: 8765
+ports_description:
+  8765/tcp: Local HTTP API for Home Assistant Core
+options:
+  port: 8765
+schema:
+  port: int(1024,65535)

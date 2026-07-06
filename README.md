@@ -1,0 +1,90 @@
+# XTB Investments for Home Assistant
+
+Custom integration, Lovelace card and local bridge add-on for read-only XTB investment statistics in Home Assistant.
+
+## Research summary
+
+XTB discontinued the classic public API access on **2025-03-14**. The old xAPI libraries that use `xapi.xtb.com` or `ws.xtb.com` should be treated as legacy only.
+
+Freshest useful project found on GitHub:
+
+| Project | Status | Notes |
+| --- | --- | --- |
+| [liskeee/xtb-api-unofficial-python](https://github.com/liskeee/xtb-api-unofficial-python) | Best candidate | Created 2026-03-24, pushed 2026-04-21, PyPI package `xtb-api-python==0.10.0`. Reverse-engineered from xStation5, supports account balance, positions, pending orders, quotes, WebSocket push events, 2FA/TOTP and session refresh. |
+| [liskeee/xtb-api-unofficial-ts](https://github.com/liskeee/xtb-api-unofficial-ts) | Useful reference | TypeScript version of the same unofficial approach. |
+| [pawelkn/xapi-python](https://github.com/pawelkn/xapi-python) | Legacy | Good older wrapper, but explicitly marked deprecated because old XTB API hosts were discontinued. |
+| [MateoGreil/xapi-go](https://github.com/MateoGreil/xapi-go) | Legacy xAPI style | Fresh Go repo, but still appears to target the old documented xAPI pattern. |
+
+XTB's own help center says API access is no longer available and was discontinued on 2025-03-14:
+[XTB Help Center](https://www.xtb.com/int/help-center/our-platforms-6-4/does-xtb-offer-investment-automation-tools-4).
+
+## Current architecture
+
+This repository starts as a Home Assistant custom integration, not a trading bot.
+
+- The Home Assistant integration has no Chromium dependency.
+- The `addons/xtb_bridge` add-on contains Chromium/Playwright and uses `xtb-api-python==0.10.0`.
+- The add-on auto-detects the XTB account number after login.
+- The integration config is intentionally simple: login, password, OTP.
+- Home Assistant polls one normalized account snapshot through a `DataUpdateCoordinator`.
+- Exposes aggregate sensors for equity, balance, free margin, open profit, open position count and pending order count.
+- Stores detailed positions, orders, quotes and account summary as attributes on the portfolio sensor.
+- Adds a dashboard card at `custom_components/xtb_investments/frontend/xtb-investments-card.js`.
+- Does not expose buy/sell/cancel services.
+
+## Why the bridge exists
+
+The unofficial Python library may require Playwright Chromium during login because XTB can block the direct REST login path with a WAF. Home Assistant Core should not install or manage Chromium inside a custom integration, so the browser part runs in a local add-on container.
+
+## Installation
+
+Install the add-on first:
+
+1. In Home Assistant, add this repository to the add-on store.
+2. Install **XTB Bridge**.
+3. Start the add-on. It exposes `http://127.0.0.1:8765` to Home Assistant Core.
+
+Install the integration through HACS as a custom integration repository, or copy `custom_components/xtb_investments` to `/config/custom_components/xtb_investments`.
+
+Restart Home Assistant, then add the integration from **Settings > Devices & services > Add integration > XTB Investments**.
+
+Config fields:
+
+- `email`: XTB login/email
+- `password`: XTB password
+- `otp`: base32 TOTP/OTP secret used to generate one-time codes
+
+## Dashboard card
+
+Add `/xtb_investments/xtb-investments-card.js` as a JavaScript module resource in Home Assistant dashboards. The path is served by the integration after HA loads it.
+
+Example card:
+
+```yaml
+type: custom:xtb-investments-card
+entity: sensor.xtb_portfolio
+show_positions: true
+show_quotes: true
+show_orders: true
+```
+
+Use the actual portfolio entity ID created by Home Assistant if it differs from the example.
+
+## Entities
+
+The integration creates:
+
+- Portfolio sensor with full snapshot attributes
+- Balance sensor
+- Free margin sensor
+- Open profit sensor
+- Open profit percent sensor
+- Open positions count sensor
+- Pending orders count sensor
+- Quote sensors for symbols in the initial setup snapshot
+
+New symbols from later-opened positions still appear in the portfolio sensor attributes and card after refresh. Reload the integration if you also want separate quote entities for them.
+
+## Safety
+
+This integration is read-only by design. It stores credentials in Home Assistant's config entry storage and sends them only to the local bridge add-on. Run it only in a trusted HA instance. Test carefully because XTB's internal API can change without notice.

@@ -1,0 +1,43 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "XTB Investments",
+        "description": "Połącz odczytową integrację Home Assistanta z XTB xStation5 przez nieoficjalnego klienta API.",
+        "data": {
+          "email": "Login",
+          "password": "Hasło",
+          "otp": "OTP"
+        }
+      }
+    }
+  },
+  "entity": {
+    "sensor": {
+      "portfolio": {
+        "name": "Portfel"
+      },
+      "balance": {
+        "name": "Saldo"
+      },
+      "free_margin": {
+        "name": "Wolny margin"
+      },
+      "open_profit_net": {
+        "name": "Wynik otwarty"
+      },
+      "open_profit_percent": {
+        "name": "Wynik otwarty procent"
+      },
+      "open_positions": {
+        "name": "Otwarte pozycje"
+      },
+      "pending_orders": {
+        "name": "Zlecenia oczekujące"
+      },
+      "quote": {
+        "name": "{symbol}"
+      }
+    }
+  }
+}
