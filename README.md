@@ -68,7 +68,7 @@ The integration registers `/xtb_investments/xtb-investments-card.js?v=<version>`
 If your dashboard is in YAML mode or HA blocks automatic resource writes, add this module resource manually:
 
 ```yaml
-url: /xtb_investments/xtb-investments-card.js?v=0.1.9
+url: /xtb_investments/xtb-investments-card.js?v=0.1.10
 type: module
 ```
 
@@ -94,7 +94,7 @@ The integration creates:
 - Profit percent sensor
 - Open positions count sensor, disabled by default as a diagnostic entity
 - Pending orders count sensor, disabled by default as a diagnostic entity
-- Daily percent change sensors for instruments in the initial setup snapshot; values come only from XTB daily quote fields or current price versus previous close. If XTB does not expose daily data, the entity remains unavailable instead of showing position return.
+- Daily percent change sensors for instruments in the initial setup snapshot; values are calculated the same way as xStation5, from `xcloseprice.close1day` and the current tick bid. If XTB does not expose close-price data, the entity remains unavailable instead of showing position return.
 - Profit/loss sensors for open positions in the initial setup snapshot
 
 New symbols from later-opened positions still appear in the balance sensor attributes and card after refresh. Reload the integration if you also want separate symbol or position entities for them.

@@ -38,6 +38,21 @@ PENDING_LOGIN_TTL_SECONDS = 300
 BROWSER_LOGIN_TIMEOUT_SECONDS = int(os.environ.get("XTB_BROWSER_LOGIN_TIMEOUT", "90"))
 BALANCE_SNAPSHOT_POLL_MS = 200
 BALANCE_SNAPSHOT_MAX_WAIT_MS = 3000
+CLOSE_PRICE_EID = 1005
+CLOSE_PRICE_FIELDS = (
+    "close1day",
+    "close1dayTime",
+    "close7days",
+    "close7daysTime",
+    "close30days",
+    "close30daysTime",
+    "close3months",
+    "close3monthsTime",
+    "close6months",
+    "close6monthsTime",
+    "close1year",
+    "close1yearTime",
+)
 
 logging.basicConfig(
     level=os.environ.get("LOG_LEVEL", "INFO"),
@@ -968,10 +983,67 @@ async def _fetch_quote_data(
                 with contextlib.suppress(Exception):
                     await client.ws.unsubscribe_ticks(key)
             if tick:
+                close_price = await _fetch_close_price_data(client, key)
+                if close_price:
+                    tick = _apply_close_price_data(tick, close_price)
                 return tick
         except Exception:
             continue
     return None
+
+
+async def _fetch_close_price_data(client: XTBClient, key: str) -> dict[str, Any] | None:
+    try:
+        res = await client.ws.send(
+            "getAndSubscribeClosePrices",
+            {"getAndSubscribeElement": {"eid": CLOSE_PRICE_EID, "keys": [key]}},
+            timeout_ms=30000,
+        )
+        return _first_element_payload(client.ws._extract_elements(res), "xcloseprice")
+    except Exception as err:  # noqa: BLE001
+        LOGGER.debug("Unable to fetch XTB close price for %s: %s", key, err)
+        return None
+    finally:
+        with contextlib.suppress(Exception):
+            await client.ws.send(
+                "unsubscribeClosePrices",
+                {"unsubscribeElement": {"eid": CLOSE_PRICE_EID, "keys": [key]}},
+                timeout_ms=10000,
+            )
+
+
+def _apply_close_price_data(
+    quote: dict[str, Any],
+    close_price_raw: dict[str, Any],
+) -> dict[str, Any]:
+    data = dict(quote)
+    close_price = _to_dict(close_price_raw)
+    data["close_price"] = {
+        key: close_price[key]
+        for key in (*CLOSE_PRICE_FIELDS, "quoteId", "symbol", "assetClass", "timestamp", "key")
+        if key in close_price
+    }
+    for key in CLOSE_PRICE_FIELDS:
+        if key in close_price and data.get(key) in (None, ""):
+            data[key] = close_price[key]
+
+    previous = _first_float(close_price, "close1day")
+    if previous is None:
+        return data
+
+    data["previousClose"] = previous
+    data["previous_close_source"] = "xcloseprice.close1day"
+
+    bid = _first_float(data, "bid")
+    if bid is None:
+        return data
+
+    daily_change = bid - previous
+    data["dailyChange"] = daily_change
+    data["dailyChangePercent"] = (daily_change / previous) * 100 if previous else None
+    data["daily_change_percent_source"] = "xcloseprice.close1day+tick.bid"
+    data["daily_change_source"] = "xcloseprice.close1day+tick.bid"
+    return data
 
 
 async def _fetch_instrument_info(client: XTBClient, symbol: str) -> dict[str, Any]:
@@ -1352,6 +1424,7 @@ def _normalize_quote(symbol: str, raw: Any) -> dict[str, Any]:
 
     previous = _first_float(
         data,
+        "close1day",
         "previousClose",
         "previous_close",
         "prevClose",
@@ -1422,8 +1495,18 @@ def _normalize_quote(symbol: str, raw: Any) -> dict[str, Any]:
         "high": _first_float(data, "high"),
         "low": _first_float(data, "low"),
         "previous": previous,
+        "previous_source": _first_str(data, "previous_close_source", "previousSource"),
+        "close1day": _first_float(data, "close1day"),
+        "close1day_time": _lookup_value(data, "close1dayTime"),
+        "close_price": data.get("close_price") if isinstance(data.get("close_price"), dict) else None,
         "daily_change": _rounded(daily_change),
         "daily_change_percent": _rounded(daily_change_percent),
+        "daily_change_source": _first_str(data, "daily_change_source", "dailyChangeSource"),
+        "daily_change_percent_source": _first_str(
+            data,
+            "daily_change_percent_source",
+            "dailyChangePercentSource",
+        ),
         "time": _lookup_value(data, "timestamp") or _lookup_value(data, "time"),
         "raw_keys": sorted(data.keys()),
     }

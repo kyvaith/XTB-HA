@@ -123,7 +123,19 @@ async def async_setup_entry(
 ) -> None:
     """Set up XTB sensors."""
     coordinator: XTBCoordinator = hass.data[DOMAIN][entry.entry_id]
-    _remove_legacy_entities(hass, entry)
+    current_quote_ids = {
+        _quote_unique_id(entry, symbol) for symbol in coordinator.data.quotes
+    }
+    current_position_profit_ids = {
+        _position_profit_unique_id(entry, position, index)
+        for index, position in enumerate(coordinator.data.positions)
+    }
+    _remove_legacy_entities(
+        hass,
+        entry,
+        current_quote_ids=current_quote_ids,
+        current_position_profit_ids=current_position_profit_ids,
+    )
     entities: list[SensorEntity] = [
         XTBAggregateSensor(coordinator, entry, description) for description in SENSORS
     ]
@@ -201,7 +213,7 @@ class XTBQuoteSensor(XTBBaseSensor):
     def __init__(self, coordinator: XTBCoordinator, entry: ConfigEntry, symbol: str) -> None:
         super().__init__(coordinator, entry)
         self._symbol = symbol
-        self._attr_unique_id = f"{entry.entry_id}_quote_{symbol.lower().replace('.', '_')}"
+        self._attr_unique_id = _quote_unique_id(entry, symbol)
         self._attr_name = f"{_instrument_name(coordinator.data, symbol)} dzienna zmiana"
 
     @property
@@ -244,7 +256,7 @@ class XTBPositionProfitSensor(XTBBaseSensor):
         super().__init__(coordinator, entry)
         self._position_key = _position_key(position, index)
         symbol = _position_name(position) or f"pozycja {index + 1}"
-        self._attr_unique_id = f"{entry.entry_id}_position_profit_{self._position_key}"
+        self._attr_unique_id = _position_profit_unique_id(entry, position, index)
         self._attr_name = f"{symbol} zysk/strata"
 
     @property
@@ -295,12 +307,44 @@ def _position_for_symbol(
     return None
 
 
-def _remove_legacy_entities(hass: HomeAssistant, entry: ConfigEntry) -> None:
+def _remove_legacy_entities(
+    hass: HomeAssistant,
+    entry: ConfigEntry,
+    *,
+    current_quote_ids: set[str],
+    current_position_profit_ids: set[str],
+) -> None:
     registry = er.async_get(hass)
     for unique_id in (f"{entry.entry_id}_portfolio",):
         entity_id = registry.async_get_entity_id("sensor", DOMAIN, unique_id)
         if entity_id is not None:
             registry.async_remove(entity_id)
+
+    stale_prefixes = {
+        f"{entry.entry_id}_quote_": current_quote_ids,
+        f"{entry.entry_id}_position_profit_": current_position_profit_ids,
+    }
+    for entity in list(registry.entities.values()):
+        if entity.domain != "sensor" or entity.platform != DOMAIN:
+            continue
+        if entity.config_entry_id not in (None, entry.entry_id):
+            continue
+        for prefix, current_ids in stale_prefixes.items():
+            if entity.unique_id.startswith(prefix) and entity.unique_id not in current_ids:
+                registry.async_remove(entity.entity_id)
+                break
+
+
+def _quote_unique_id(entry: ConfigEntry, symbol: str) -> str:
+    return f"{entry.entry_id}_quote_{symbol.lower().replace('.', '_')}"
+
+
+def _position_profit_unique_id(
+    entry: ConfigEntry,
+    position: dict[str, Any],
+    index: int,
+) -> str:
+    return f"{entry.entry_id}_position_profit_{_position_key(position, index)}"
 
 
 def _account_value(data: XTBSnapshot) -> StateValue:
@@ -371,25 +415,18 @@ def _position_name(position: dict[str, Any]) -> str | None:
 
 def _change_percent_value(data: XTBSnapshot, symbol: str) -> StateValue:
     quote = data.quotes.get(symbol, {})
-    position = _position_for_symbol(data.positions, symbol) or {}
     return _first_present(
         quote.get("daily_change_percent"),
-        position.get("daily_change_percent"),
         quote.get("change_percent"),
     )
 
 
 def _change_percent_source(data: XTBSnapshot, symbol: str) -> str | None:
     quote = data.quotes.get(symbol, {})
-    position = _position_for_symbol(data.positions, symbol) or {}
-    candidates = (
-        ("quote_daily_change_percent", quote.get("daily_change_percent")),
-        ("position_daily_change_percent", position.get("daily_change_percent")),
-        ("quote_change_percent", quote.get("change_percent")),
-    )
-    for source, value in candidates:
-        if value is not None:
-            return source
+    if quote.get("daily_change_percent") is not None:
+        return quote.get("daily_change_percent_source") or "quote_daily_change_percent"
+    if quote.get("change_percent") is not None:
+        return "quote_change_percent"
     return None
 
 
