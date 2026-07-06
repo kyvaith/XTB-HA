@@ -786,9 +786,12 @@ def _merge_snapshots(
         "currency": primary.get("account", {}).get("currency") or accounts[0].get("currency") or "",
         "balance": _sum_values(accounts, "balance"),
         "cash_balance": _sum_values(accounts, "cash_balance"),
+        "side_bar_account_value": _sum_values(accounts, "side_bar_account_value"),
+        "total_equity": _sum_values(accounts, "total_equity"),
         "equity": _sum_values(accounts, "equity"),
         "free_margin": _sum_values(accounts, "free_margin"),
         "asset_value": _sum_values(accounts, "asset_value"),
+        "account_value": _sum_values(accounts, "account_value"),
         "portfolio_value": _sum_values(accounts, "portfolio_value"),
         "profit_net": _sum_values(accounts, "profit_net"),
         "value_source": "aggregate",
@@ -877,20 +880,6 @@ async def _snapshot(client: XTBClient) -> dict[str, Any]:
             price_change = current_price - open_price
             position["price_change"] = _rounded(price_change)
             position["price_change_percent"] = _rounded((price_change / open_price) * 100)
-        if position.get("daily_change_percent") is None:
-            position["daily_change_percent"] = _first_present(
-                position.get("price_change_percent"),
-                position.get("profit_loss_percent"),
-                position.get("profit_percent"),
-            )
-            if position.get("daily_change_percent") is not None:
-                position["daily_change_percent_source"] = "position_fallback"
-        if quote.get("daily_change_percent") is None and position.get("daily_change_percent") is not None:
-            quote["daily_change_percent"] = position.get("daily_change_percent")
-            quote["daily_change_percent_source"] = position.get(
-                "daily_change_percent_source",
-                "position",
-            )
 
     calculated_asset_value = sum(
         value
@@ -904,6 +893,7 @@ async def _snapshot(client: XTBClient) -> dict[str, Any]:
         asset_value = _float(account.get("asset_value"))
         if cash_balance is not None and asset_value is not None:
             account["portfolio_value"] = _rounded(cash_balance + asset_value)
+            account["account_value"] = account["portfolio_value"]
             account["value_source"] = "cash_plus_assets"
 
     return {
@@ -1001,6 +991,7 @@ async def _fetch_instrument_info(client: XTBClient, symbol: str) -> dict[str, An
     data = _to_dict(exact)
     name = _first_str(data, "name", "description", "display_name", "displayName") or symbol
     description = _first_str(data, "description", "full_description", "fullDescription") or name
+    market_info = _normalize_quote(symbol, data)
     return {
         "symbol": symbol,
         "name": name,
@@ -1008,13 +999,41 @@ async def _fetch_instrument_info(client: XTBClient, symbol: str) -> dict[str, An
         "description": description,
         "symbol_key": _first_str(data, "symbol_key", "symbolKey"),
         "instrument_id": _int(_lookup_value(data, "instrument_id")),
+        "bid": market_info.get("bid"),
+        "ask": market_info.get("ask"),
+        "mid": market_info.get("mid"),
+        "spread": market_info.get("spread"),
+        "spread_percent": market_info.get("spread_percent"),
+        "high": market_info.get("high"),
+        "low": market_info.get("low"),
+        "previous": market_info.get("previous"),
+        "daily_change": market_info.get("daily_change"),
+        "daily_change_percent": market_info.get("daily_change_percent"),
+        "time": market_info.get("time"),
     }
 
 
 def _apply_instrument_info(item: dict[str, Any], info: dict[str, Any] | None) -> None:
     if not info:
         return
-    for key in ("name", "display_name", "description", "symbol_key", "instrument_id"):
+    for key in (
+        "name",
+        "display_name",
+        "description",
+        "symbol_key",
+        "instrument_id",
+        "bid",
+        "ask",
+        "mid",
+        "spread",
+        "spread_percent",
+        "high",
+        "low",
+        "previous",
+        "daily_change",
+        "daily_change_percent",
+        "time",
+    ):
         if item.get(key) in (None, "") and info.get(key) not in (None, ""):
             item[key] = info[key]
 
@@ -1104,30 +1123,25 @@ def _normalize_account(raw: Any, meta: dict[str, Any]) -> dict[str, Any]:
         "marketValue",
         "portfolioAssetValue",
     )
-    explicit_value = _first_float(
+    total_equity = _first_float(data, "totalEquity", "total_equity")
+    side_bar_value = _first_float(
         data,
         "sideBarAccountValue",
         "side_bar_account_value",
         "sidebarAccountValue",
+        "sideBarBalance",
+        "sidebarBalance",
+    )
+    generic_value = _first_float(
+        data,
         "accountValue",
         "account_value",
-        "portfolioValue",
-        "portfolio_value",
         "totalValue",
     )
+    raw_portfolio_value = _first_float(data, "portfolioValue", "portfolio_value")
     largest_value, largest_key = _largest_balance_value(data)
-    portfolio_value = explicit_value
-    value_source = "explicit" if explicit_value is not None else None
-
-    if portfolio_value is None and cash_balance is not None and asset_value is not None:
-        portfolio_value = cash_balance + asset_value
-        value_source = "cash_plus_assets"
-    if portfolio_value is None and largest_value is not None:
-        portfolio_value = largest_value
-        value_source = f"largest_balance_field:{largest_key}"
-    if portfolio_value is None:
-        portfolio_value = equity if equity is not None else raw_balance
-        value_source = "equity_or_balance"
+    portfolio_value = side_bar_value
+    value_source = "side_bar_account_value" if side_bar_value is not None else None
 
     profit_net = _first_float(
         data,
@@ -1146,13 +1160,35 @@ def _normalize_account(raw: Any, meta: dict[str, Any]) -> dict[str, Any]:
         "floatingProfit",
     )
 
+    if portfolio_value is None and total_equity is not None and profit_net is not None:
+        portfolio_value = total_equity + profit_net
+        value_source = "total_equity_plus_net_profit"
+    if portfolio_value is None and generic_value is not None:
+        portfolio_value = generic_value
+        value_source = "account_value"
+    if portfolio_value is None and raw_portfolio_value is not None:
+        portfolio_value = raw_portfolio_value
+        value_source = "portfolio_value"
+    if portfolio_value is None and cash_balance is not None and asset_value is not None:
+        portfolio_value = cash_balance + asset_value
+        value_source = "cash_plus_assets"
+    if portfolio_value is None and largest_value is not None:
+        portfolio_value = largest_value
+        value_source = f"largest_balance_field:{largest_key}"
+    if portfolio_value is None:
+        portfolio_value = equity if equity is not None else raw_balance
+        value_source = "equity_or_balance"
+
     return {
         "account_number": _int(data.get("account_number")) or meta.get("account_number"),
         "balance": _rounded(raw_balance),
         "cash_balance": _rounded(cash_balance),
+        "side_bar_account_value": _rounded(side_bar_value),
+        "total_equity": _rounded(total_equity),
         "equity": _rounded(equity),
         "free_margin": _rounded(free_margin),
         "asset_value": _rounded(asset_value),
+        "account_value": _rounded(portfolio_value),
         "portfolio_value": _rounded(portfolio_value),
         "profit_net": _rounded(profit_net),
         "profit_percent": _rounded(
@@ -1232,14 +1268,31 @@ def _normalize_position(raw: Any, account: dict[str, Any]) -> dict[str, Any]:
         "open_price": open_price,
         "price_change": _rounded(price_change),
         "price_change_percent": _rounded(price_change_percent),
-        "daily_change": _rounded(_first_float(data, "dailyChange", "dayChange", "change")),
+        "daily_change": _rounded(
+            _first_float(
+                data,
+                "dailyChange",
+                "daily_change",
+                "dayChange",
+                "day_change",
+                "dailyPriceChange",
+                "dayPriceChange",
+                "todayChange",
+            )
+        ),
         "daily_change_percent": _rounded(
             _first_float(
                 data,
                 "dailyChangePercent",
+                "daily_change_percent",
                 "dayChangePercent",
-                "changePercent",
-                "changePercentage",
+                "day_change_percent",
+                "dailyPercentageChange",
+                "dayPercentageChange",
+                "dailyChangePct",
+                "dayChangePct",
+                "todayChangePercent",
+                "todayChangePercentage",
             )
         ),
         "profit_loss": _rounded(profit_loss),
@@ -1303,11 +1356,29 @@ def _normalize_quote(symbol: str, raw: Any) -> dict[str, Any]:
         "previous_close",
         "prevClose",
         "prev_close",
+        "previousDayClose",
+        "previousClosePrice",
+        "lastClose",
+        "lastClosePrice",
+        "yesterdayClose",
+        "yesterdayClosePrice",
+        "prevDayClose",
         "referencePrice",
         "close",
         "open",
     )
-    daily_change = _first_float(data, "dailyChange", "daily_change", "dayChange", "change")
+    daily_change = _first_float(
+        data,
+        "dailyChange",
+        "daily_change",
+        "dayChange",
+        "day_change",
+        "dailyPriceChange",
+        "dayPriceChange",
+        "todayChange",
+        "priceChange",
+        "change",
+    )
     if daily_change is None and mid is not None and previous:
         daily_change = mid - previous
 
@@ -1319,7 +1390,20 @@ def _normalize_quote(symbol: str, raw: Any) -> dict[str, Any]:
         "changePercent",
         "changePercentage",
         "percentageChange",
+        "percentChange",
+        "dailyPercentageChange",
+        "dayPercentageChange",
+        "percentageDailyChange",
+        "dailyChangePct",
+        "dayChangePct",
+        "changePct",
         "pctChange",
+        "dailyReturn",
+        "dailyReturnPercent",
+        "dayReturn",
+        "dayReturnPercent",
+        "todayChangePercent",
+        "todayChangePercentage",
     )
     if daily_change_percent is None and daily_change is not None and previous:
         daily_change_percent = (daily_change / previous) * 100
@@ -1371,10 +1455,8 @@ def _build_summary(
     cash_funds = cash_balance if cash_balance is not None else _float(account.get("balance"))
     equity = _float(account.get("equity"))
     free_margin = _float(account.get("free_margin"))
-    portfolio_value = _float(account.get("portfolio_value"))
+    total_equity = _float(account.get("total_equity"))
     asset_value = _float(account.get("asset_value"))
-    if portfolio_value is None:
-        portfolio_value = equity if equity is not None else cash_funds
 
     used_margin = (
         max(equity - free_margin, 0.0)
@@ -1389,6 +1471,21 @@ def _build_summary(
     profit_net = _float(account.get("profit_net"))
     if profit_net is None and positions:
         profit_net = position_profit_net
+    total_equity_with_profit = (
+        total_equity + profit_net
+        if total_equity is not None and profit_net is not None
+        else None
+    )
+    portfolio_value = _first_present(
+        total_equity_with_profit,
+        _float(account.get("account_value")),
+        _float(account.get("portfolio_value")),
+    )
+    value_source = account.get("value_source")
+    if total_equity_with_profit is not None:
+        value_source = "total_equity_plus_net_profit"
+    if portfolio_value is None:
+        portfolio_value = equity if equity is not None else cash_funds
     profit_percent = _float(account.get("profit_percent"))
     if profit_percent is None and profit_net is not None and portfolio_value:
         cost_basis = portfolio_value - profit_net
@@ -1406,10 +1503,12 @@ def _build_summary(
         "account_numbers": account.get("account_numbers") or [account.get("account_number")],
         "account_count": account.get("account_count") or 1,
         "currency": account.get("currency") or "",
+        "side_bar_account_value": _rounded(_float(account.get("side_bar_account_value"))),
         "portfolio_value": _rounded(portfolio_value),
         "account_value": _rounded(portfolio_value),
         "balance": _rounded(portfolio_value),
         "cash_balance": _rounded(cash_funds),
+        "total_equity": _rounded(total_equity),
         "equity": _rounded(equity),
         "free_margin": _rounded(free_margin),
         "asset_value": _rounded(asset_value),
@@ -1424,7 +1523,7 @@ def _build_summary(
         "average_daily_change_percent": _rounded(
             sum(daily_changes) / len(daily_changes) if daily_changes else None
         ),
-        "value_source": account.get("value_source"),
+        "value_source": value_source,
     }
 
 

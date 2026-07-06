@@ -306,11 +306,23 @@ def _remove_legacy_entities(hass: HomeAssistant, entry: ConfigEntry) -> None:
 def _account_value(data: XTBSnapshot) -> StateValue:
     cash_balance = _first_present(data.summary.get("cash_balance"), data.account.get("cash_balance"))
     asset_value = _first_present(data.summary.get("asset_value"), data.account.get("asset_value"))
+    total_equity = _first_present(data.summary.get("total_equity"), data.account.get("total_equity"))
+    profit_net = _first_present(data.summary.get("profit_net"), data.account.get("profit_net"))
     calculated_value = None
-    if cash_balance is not None and asset_value is not None:
-        calculated_value = cash_balance + asset_value
+    cash_balance_number = _as_float(cash_balance)
+    asset_value_number = _as_float(asset_value)
+    if cash_balance_number is not None and asset_value_number is not None:
+        calculated_value = cash_balance_number + asset_value_number
+    total_equity_with_profit = None
+    total_equity_number = _as_float(total_equity)
+    profit_net_number = _as_float(profit_net)
+    if total_equity_number is not None and profit_net_number is not None:
+        total_equity_with_profit = total_equity_number + profit_net_number
 
     return _first_present(
+        data.summary.get("side_bar_account_value"),
+        data.account.get("side_bar_account_value"),
+        total_equity_with_profit,
         data.summary.get("account_value"),
         data.summary.get("portfolio_value"),
         data.account.get("account_value"),
@@ -364,9 +376,6 @@ def _change_percent_value(data: XTBSnapshot, symbol: str) -> StateValue:
         quote.get("daily_change_percent"),
         position.get("daily_change_percent"),
         quote.get("change_percent"),
-        position.get("price_change_percent"),
-        position.get("profit_loss_percent"),
-        position.get("profit_percent"),
     )
 
 
@@ -377,9 +386,6 @@ def _change_percent_source(data: XTBSnapshot, symbol: str) -> str | None:
         ("quote_daily_change_percent", quote.get("daily_change_percent")),
         ("position_daily_change_percent", position.get("daily_change_percent")),
         ("quote_change_percent", quote.get("change_percent")),
-        ("position_price_change_percent", position.get("price_change_percent")),
-        ("position_profit_loss_percent", position.get("profit_loss_percent")),
-        ("position_profit_percent", position.get("profit_percent")),
     )
     for source, value in candidates:
         if value is not None:
@@ -392,6 +398,15 @@ def _first_present(*values: Any) -> Any:
         if value is not None:
             return value
     return None
+
+
+def _as_float(value: Any) -> float | None:
+    if value in (None, ""):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _position_key(position: dict[str, Any], index: int) -> str:

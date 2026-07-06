@@ -6,8 +6,8 @@ class XTBInvestmentsCard extends HTMLElement {
 
     this.config = {
       show_positions: true,
-      show_quotes: true,
-      show_orders: true,
+      show_quotes: false,
+      show_orders: false,
       ...config,
     };
   }
@@ -25,8 +25,8 @@ class XTBInvestmentsCard extends HTMLElement {
     return {
       entity: "sensor.xtb_balance",
       show_positions: true,
-      show_quotes: true,
-      show_orders: true,
+      show_quotes: false,
+      show_orders: false,
     };
   }
 
@@ -52,24 +52,34 @@ class XTBInvestmentsCard extends HTMLElement {
     const orders = Array.isArray(attrs.orders) ? attrs.orders : [];
     const quotes = Object.values(attrs.quotes || {});
     const currency = summary.currency || attrs.unit_of_measurement || "";
+    const totalEquity = this.asNumber(summary.total_equity);
+    const profitNet = this.asNumber(summary.profit_net);
+    const totalEquityWithProfit =
+      totalEquity !== undefined && profitNet !== undefined ? totalEquity + profitNet : undefined;
+    const cashBalance = this.asNumber(summary.cash_balance);
+    const assetValue = this.asNumber(summary.asset_value);
     const calculatedAccountValue =
-      Number.isFinite(Number(summary.cash_balance)) && Number.isFinite(Number(summary.asset_value))
-        ? Number(summary.cash_balance) + Number(summary.asset_value)
+      cashBalance !== undefined && assetValue !== undefined
+        ? cashBalance + assetValue
         : undefined;
-    const accountValue = summary.account_value ?? summary.portfolio_value ?? calculatedAccountValue ?? summary.balance ?? state.state;
+    const accountValue =
+      summary.side_bar_account_value ??
+      totalEquityWithProfit ??
+      summary.account_value ??
+      summary.portfolio_value ??
+      calculatedAccountValue ??
+      summary.balance ??
+      state.state;
     const profit = Number(summary.profit_net ?? summary.position_profit_net ?? 0);
     const profitClass = profit >= 0 ? "positive" : "negative";
 
     this.innerHTML = `
       <ha-card>
         <div class="xtb-card">
-          <header class="xtb-header">
-            <div>
-              <div class="eyebrow">XTB</div>
-              <h2>Saldo</h2>
-            </div>
+          <div class="xtb-topline">
+            <span>XTB</span>
             <div class="updated">${this.formatDate(attrs.updated_at)}</div>
-          </header>
+          </div>
 
           <section class="hero">
             <div>
@@ -84,7 +94,7 @@ class XTBInvestmentsCard extends HTMLElement {
           </section>
 
           <section class="metrics">
-            ${this.metric("Wolne środki", this.money(summary.cash_balance, currency), "mdi:cash")}
+            ${this.metric("Wolne", this.money(summary.cash_balance, currency), "mdi:cash")}
             ${this.metric("Aktywa", this.money(summary.asset_value, currency), "mdi:briefcase-check")}
             ${this.metric("Pozycje", summary.open_positions ?? positions.length, "mdi:format-list-bulleted")}
             ${this.metric("Zlecenia", summary.pending_orders ?? orders.length, "mdi:clipboard-clock")}
@@ -118,7 +128,7 @@ class XTBInvestmentsCard extends HTMLElement {
           }
 
           ${
-            this.config.show_quotes
+            this.config.show_quotes && quotes.length
               ? this.tableSection(
                   "Notowania",
                   quotes,
@@ -139,7 +149,7 @@ class XTBInvestmentsCard extends HTMLElement {
           }
 
           ${
-            this.config.show_orders
+            this.config.show_orders && orders.length
               ? this.tableSection(
                   "Zlecenia",
                   orders,
@@ -240,6 +250,11 @@ class XTBInvestmentsCard extends HTMLElement {
     }).format(amount)}%`;
   }
 
+  asNumber(value) {
+    const amount = Number(value);
+    return Number.isFinite(amount) ? amount : undefined;
+  }
+
   formatDate(value) {
     if (!value) {
       return "";
@@ -279,7 +294,7 @@ class XTBInvestmentsCard extends HTMLElement {
           color: var(--error-color);
         }
 
-        .xtb-header,
+        .xtb-topline,
         .hero,
         .metrics,
         .profit,
@@ -288,28 +303,20 @@ class XTBInvestmentsCard extends HTMLElement {
           align-items: center;
         }
 
-        .xtb-header {
+        .xtb-topline {
           justify-content: space-between;
           gap: 16px;
-          margin-bottom: 14px;
-        }
-
-        .eyebrow {
+          margin-bottom: 10px;
           color: var(--secondary-text-color);
           font-size: 11px;
           letter-spacing: 0;
           text-transform: uppercase;
         }
 
-        h2,
         h3 {
           margin: 0;
           font-weight: 650;
           letter-spacing: 0;
-        }
-
-        h2 {
-          font-size: 22px;
         }
 
         h3 {
@@ -326,8 +333,7 @@ class XTBInvestmentsCard extends HTMLElement {
         .hero {
           justify-content: space-between;
           gap: 18px;
-          padding: 14px 0 16px;
-          border-top: 1px solid var(--divider-color);
+          padding: 8px 0 16px;
           border-bottom: 1px solid var(--divider-color);
         }
 
@@ -373,7 +379,7 @@ class XTBInvestmentsCard extends HTMLElement {
 
         .metrics {
           display: grid;
-          grid-template-columns: repeat(4, minmax(0, 1fr));
+          grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
           gap: 8px;
           margin: 14px 0 18px;
         }

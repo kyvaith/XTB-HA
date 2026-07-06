@@ -68,7 +68,7 @@ The integration registers `/xtb_investments/xtb-investments-card.js?v=<version>`
 If your dashboard is in YAML mode or HA blocks automatic resource writes, add this module resource manually:
 
 ```yaml
-url: /xtb_investments/xtb-investments-card.js?v=0.1.8
+url: /xtb_investments/xtb-investments-card.js?v=0.1.9
 type: module
 ```
 
@@ -78,8 +78,8 @@ Example card:
 type: custom:xtb-investments-card
 entity: sensor.xtb_balance
 show_positions: true
-show_quotes: true
-show_orders: true
+show_quotes: false
+show_orders: false
 ```
 
 Use the actual balance entity ID created by Home Assistant if it differs from the example.
@@ -94,7 +94,7 @@ The integration creates:
 - Profit percent sensor
 - Open positions count sensor, disabled by default as a diagnostic entity
 - Pending orders count sensor, disabled by default as a diagnostic entity
-- Daily percent change sensors for instruments in the initial setup snapshot; if XTB does not expose an explicit daily percentage, the integration falls back to the position percentage so the entity remains usable
+- Daily percent change sensors for instruments in the initial setup snapshot; values come only from XTB daily quote fields or current price versus previous close. If XTB does not expose daily data, the entity remains unavailable instead of showing position return.
 - Profit/loss sensors for open positions in the initial setup snapshot
 
 New symbols from later-opened positions still appear in the balance sensor attributes and card after refresh. Reload the integration if you also want separate symbol or position entities for them.
