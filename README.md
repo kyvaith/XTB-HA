@@ -32,7 +32,7 @@ This repository starts as a Home Assistant custom integration, not a trading bot
 - Home Assistant polls one normalized investment snapshot through a `DataUpdateCoordinator`.
 - Exposes aggregate sensors for account balance, free funds, total profit, profit percent, open position count and pending order count.
 - Stores detailed positions, orders, quotes and account summary as attributes on the balance sensor.
-- Creates symbol daily-change sensors and per-position profit/loss sensors.
+- Creates instrument-name daily-change sensors and per-position profit/loss sensors.
 - Adds a dashboard card at `custom_components/xtb_investments/frontend/xtb-investments-card.js` and registers it as a Lovelace module resource automatically.
 - Does not expose buy/sell/cancel services.
 
@@ -68,7 +68,7 @@ The integration registers `/xtb_investments/xtb-investments-card.js?v=<version>`
 If your dashboard is in YAML mode or HA blocks automatic resource writes, add this module resource manually:
 
 ```yaml
-url: /xtb_investments/xtb-investments-card.js?v=0.1.7
+url: /xtb_investments/xtb-investments-card.js?v=0.1.8
 type: module
 ```
 
@@ -94,7 +94,7 @@ The integration creates:
 - Profit percent sensor
 - Open positions count sensor, disabled by default as a diagnostic entity
 - Pending orders count sensor, disabled by default as a diagnostic entity
-- Daily percent change sensors for symbols in the initial setup snapshot
+- Daily percent change sensors for instruments in the initial setup snapshot; if XTB does not expose an explicit daily percentage, the integration falls back to the position percentage so the entity remains usable
 - Profit/loss sensors for open positions in the initial setup snapshot
 
 New symbols from later-opened positions still appear in the balance sensor attributes and card after refresh. Reload the integration if you also want separate symbol or position entities for them.

@@ -822,12 +822,21 @@ async def _snapshot(client: XTBClient) -> dict[str, Any]:
             *(order["symbol"] for order in orders if order.get("symbol")),
         }
     )
+    instruments: dict[str, dict[str, Any]] = {}
     symbol_keys: dict[str, str] = {}
     for item in [*positions, *orders]:
         symbol = item.get("symbol")
         symbol_key = item.get("symbol_key")
         if symbol and symbol_key:
             symbol_keys[str(symbol)] = str(symbol_key)
+
+    for symbol in symbols:
+        instruments[symbol] = await _fetch_instrument_info(client, symbol)
+        if instruments[symbol].get("symbol_key"):
+            symbol_keys.setdefault(symbol, str(instruments[symbol]["symbol_key"]))
+
+    for item in [*positions, *orders]:
+        _apply_instrument_info(item, instruments.get(str(item.get("symbol"))))
 
     quotes: dict[str, dict[str, Any]] = {}
     for symbol in symbols:
@@ -836,13 +845,20 @@ async def _snapshot(client: XTBClient) -> dict[str, Any]:
             if quote is None:
                 quote = await client.get_quote(symbol)
             quotes[symbol] = _normalize_quote(symbol, quote)
+            _apply_instrument_info(quotes[symbol], instruments.get(symbol))
         except Exception as err:  # noqa: BLE001
             LOGGER.debug("Unable to fetch raw quote for %s: %s", symbol, err)
             try:
                 quotes[symbol] = _normalize_quote(symbol, await client.get_quote(symbol))
+                _apply_instrument_info(quotes[symbol], instruments.get(symbol))
             except Exception as fallback_err:  # noqa: BLE001
                 LOGGER.debug("Unable to fetch fallback quote for %s: %s", symbol, fallback_err)
-                quotes[symbol] = {"symbol": symbol, "available": False, "error": str(fallback_err)}
+                quotes[symbol] = {
+                    "symbol": symbol,
+                    "available": False,
+                    "error": str(fallback_err),
+                }
+                _apply_instrument_info(quotes[symbol], instruments.get(symbol))
 
     for position in positions:
         quote = quotes.get(position["symbol"], {})
@@ -861,6 +877,20 @@ async def _snapshot(client: XTBClient) -> dict[str, Any]:
             price_change = current_price - open_price
             position["price_change"] = _rounded(price_change)
             position["price_change_percent"] = _rounded((price_change / open_price) * 100)
+        if position.get("daily_change_percent") is None:
+            position["daily_change_percent"] = _first_present(
+                position.get("price_change_percent"),
+                position.get("profit_loss_percent"),
+                position.get("profit_percent"),
+            )
+            if position.get("daily_change_percent") is not None:
+                position["daily_change_percent_source"] = "position_fallback"
+        if quote.get("daily_change_percent") is None and position.get("daily_change_percent") is not None:
+            quote["daily_change_percent"] = position.get("daily_change_percent")
+            quote["daily_change_percent_source"] = position.get(
+                "daily_change_percent_source",
+                "position",
+            )
 
     calculated_asset_value = sum(
         value
@@ -952,6 +982,41 @@ async def _fetch_quote_data(
         except Exception:
             continue
     return None
+
+
+async def _fetch_instrument_info(client: XTBClient, symbol: str) -> dict[str, Any]:
+    try:
+        matches = await client.search_instrument(symbol)
+    except Exception as err:  # noqa: BLE001
+        LOGGER.debug("Unable to fetch instrument metadata for %s: %s", symbol, err)
+        return {"symbol": symbol, "name": symbol}
+
+    if not matches:
+        return {"symbol": symbol, "name": symbol}
+
+    exact = next(
+        (match for match in matches if str(match.symbol).upper() == symbol.upper()),
+        matches[0],
+    )
+    data = _to_dict(exact)
+    name = _first_str(data, "name", "description", "display_name", "displayName") or symbol
+    description = _first_str(data, "description", "full_description", "fullDescription") or name
+    return {
+        "symbol": symbol,
+        "name": name,
+        "display_name": name,
+        "description": description,
+        "symbol_key": _first_str(data, "symbol_key", "symbolKey"),
+        "instrument_id": _int(_lookup_value(data, "instrument_id")),
+    }
+
+
+def _apply_instrument_info(item: dict[str, Any], info: dict[str, Any] | None) -> None:
+    if not info:
+        return
+    for key in ("name", "display_name", "description", "symbol_key", "instrument_id"):
+        if item.get(key) in (None, "") and info.get(key) not in (None, ""):
+            item[key] = info[key]
 
 
 def _quote_candidate_keys(symbol: str, symbol_key: str | None) -> list[str]:
@@ -1158,6 +1223,9 @@ def _normalize_position(raw: Any, account: dict[str, Any]) -> dict[str, Any]:
 
     return {
         "symbol": symbol,
+        "name": _first_str(data, "name", "description", "displayName", "display_name", "instrumentName"),
+        "display_name": _first_str(data, "displayName", "display_name", "name", "description", "instrumentName"),
+        "description": _first_str(data, "description", "fullDescription", "full_description", "name"),
         "side": side,
         "volume": volume,
         "current_price": _rounded(current_price),
@@ -1198,6 +1266,9 @@ def _normalize_order(raw: Any, account: dict[str, Any]) -> dict[str, Any]:
     data = _to_dict(raw)
     return {
         "symbol": str(data.get("symbol") or "").upper(),
+        "name": _first_str(data, "name", "description", "displayName", "display_name", "instrumentName"),
+        "display_name": _first_str(data, "displayName", "display_name", "name", "description", "instrumentName"),
+        "description": _first_str(data, "description", "fullDescription", "full_description", "name"),
         "side": _normalize_side(_lookup_value(data, "side")),
         "volume": _first_float(data, "volume", "size", "amount") or 0.0,
         "price": _first_float(data, "openPrice", "open_price", "price") or 0.0,
@@ -1255,6 +1326,9 @@ def _normalize_quote(symbol: str, raw: Any) -> dict[str, Any]:
 
     return {
         "symbol": str(data.get("symbol") or symbol).upper(),
+        "name": _first_str(data, "name", "description", "displayName", "display_name", "instrumentName"),
+        "display_name": _first_str(data, "displayName", "display_name", "name", "description", "instrumentName"),
+        "description": _first_str(data, "description", "fullDescription", "full_description", "name"),
         "available": True,
         "bid": bid,
         "ask": ask,
@@ -1429,6 +1503,13 @@ def _first_str(data: dict[str, Any], *keys: str) -> str | None:
         value = _lookup_value(data, key)
         if value is not None and value != "":
             return str(value)
+    return None
+
+
+def _first_present(*values: Any) -> Any:
+    for value in values:
+        if value is not None:
+            return value
     return None
 
 

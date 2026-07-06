@@ -15,6 +15,7 @@ from homeassistant.components.sensor import (
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import PERCENTAGE
 from homeassistant.core import HomeAssistant
+from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.entity import DeviceInfo, EntityCategory
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
@@ -43,7 +44,7 @@ SENSORS: tuple[XTBSensorDescription, ...] = (
         device_class=SensorDeviceClass.MONETARY,
         state_class=SensorStateClass.MEASUREMENT,
         currency_unit=True,
-        value_fn=lambda data: data.summary.get("balance"),
+        value_fn=lambda data: _account_value(data),
         attrs_fn=lambda data: {
             "account": data.account,
             "summary": data.summary,
@@ -63,9 +64,7 @@ SENSORS: tuple[XTBSensorDescription, ...] = (
         state_class=SensorStateClass.MEASUREMENT,
         currency_unit=True,
         value_fn=lambda data: (
-            data.summary.get("cash_balance")
-            if data.summary.get("cash_balance") is not None
-            else data.summary.get("free_margin")
+            _cash_value(data)
         ),
     ),
     XTBSensorDescription(
@@ -124,6 +123,7 @@ async def async_setup_entry(
 ) -> None:
     """Set up XTB sensors."""
     coordinator: XTBCoordinator = hass.data[DOMAIN][entry.entry_id]
+    _remove_legacy_entities(hass, entry)
     entities: list[SensorEntity] = [
         XTBAggregateSensor(coordinator, entry, description) for description in SENSORS
     ]
@@ -202,16 +202,11 @@ class XTBQuoteSensor(XTBBaseSensor):
         super().__init__(coordinator, entry)
         self._symbol = symbol
         self._attr_unique_id = f"{entry.entry_id}_quote_{symbol.lower().replace('.', '_')}"
-        self._attr_name = f"{symbol} dzienna zmiana"
+        self._attr_name = f"{_instrument_name(coordinator.data, symbol)} dzienna zmiana"
 
     @property
     def native_value(self) -> StateValue:
-        quote = self.coordinator.data.quotes.get(self._symbol, {})
-        if quote.get("daily_change_percent") is not None:
-            return quote.get("daily_change_percent")
-
-        position = _position_for_symbol(self.coordinator.data.positions, self._symbol)
-        return position.get("daily_change_percent") if position else None
+        return _change_percent_value(self.coordinator.data, self._symbol)
 
     @property
     def available(self) -> bool:
@@ -223,6 +218,8 @@ class XTBQuoteSensor(XTBBaseSensor):
         position = _position_for_symbol(self.coordinator.data.positions, self._symbol)
         return {
             **quote,
+            "name": _instrument_name(self.coordinator.data, self._symbol),
+            "change_percent_source": _change_percent_source(self.coordinator.data, self._symbol),
             "position_profit_loss": position.get("profit_loss") if position else None,
             "position_market_value": position.get("market_value") if position else None,
             "currency": self.coordinator.data.summary.get("currency"),
@@ -246,7 +243,7 @@ class XTBPositionProfitSensor(XTBBaseSensor):
     ) -> None:
         super().__init__(coordinator, entry)
         self._position_key = _position_key(position, index)
-        symbol = str(position.get("symbol") or f"pozycja {index + 1}")
+        symbol = _position_name(position) or f"pozycja {index + 1}"
         self._attr_unique_id = f"{entry.entry_id}_position_profit_{self._position_key}"
         self._attr_name = f"{symbol} zysk/strata"
 
@@ -269,6 +266,7 @@ class XTBPositionProfitSensor(XTBBaseSensor):
     def extra_state_attributes(self) -> dict[str, Any]:
         position = self._current_position() or {}
         return {
+            "name": _position_name(position),
             "symbol": position.get("symbol"),
             "account_number": position.get("account_number"),
             "daily_change_percent": position.get("daily_change_percent"),
@@ -294,6 +292,105 @@ def _position_for_symbol(
     for position in positions:
         if str(position.get("symbol") or "").upper() == target:
             return position
+    return None
+
+
+def _remove_legacy_entities(hass: HomeAssistant, entry: ConfigEntry) -> None:
+    registry = er.async_get(hass)
+    for unique_id in (f"{entry.entry_id}_portfolio",):
+        entity_id = registry.async_get_entity_id("sensor", DOMAIN, unique_id)
+        if entity_id is not None:
+            registry.async_remove(entity_id)
+
+
+def _account_value(data: XTBSnapshot) -> StateValue:
+    cash_balance = _first_present(data.summary.get("cash_balance"), data.account.get("cash_balance"))
+    asset_value = _first_present(data.summary.get("asset_value"), data.account.get("asset_value"))
+    calculated_value = None
+    if cash_balance is not None and asset_value is not None:
+        calculated_value = cash_balance + asset_value
+
+    return _first_present(
+        data.summary.get("account_value"),
+        data.summary.get("portfolio_value"),
+        data.account.get("account_value"),
+        data.account.get("portfolio_value"),
+        calculated_value,
+        data.summary.get("equity"),
+        data.account.get("equity"),
+        data.summary.get("balance"),
+    )
+
+
+def _cash_value(data: XTBSnapshot) -> StateValue:
+    return _first_present(
+        data.summary.get("cash_balance"),
+        data.account.get("cash_balance"),
+        data.summary.get("free_margin"),
+        data.account.get("free_margin"),
+    )
+
+
+def _instrument_name(data: XTBSnapshot, symbol: str) -> str:
+    quote = data.quotes.get(symbol, {})
+    position = _position_for_symbol(data.positions, symbol) or {}
+    return (
+        _first_present(
+            quote.get("name"),
+            quote.get("display_name"),
+            quote.get("description"),
+            position.get("name"),
+            position.get("display_name"),
+            position.get("description"),
+            symbol,
+        )
+        or symbol
+    )
+
+
+def _position_name(position: dict[str, Any]) -> str | None:
+    return _first_present(
+        position.get("name"),
+        position.get("display_name"),
+        position.get("description"),
+        position.get("symbol"),
+    )
+
+
+def _change_percent_value(data: XTBSnapshot, symbol: str) -> StateValue:
+    quote = data.quotes.get(symbol, {})
+    position = _position_for_symbol(data.positions, symbol) or {}
+    return _first_present(
+        quote.get("daily_change_percent"),
+        position.get("daily_change_percent"),
+        quote.get("change_percent"),
+        position.get("price_change_percent"),
+        position.get("profit_loss_percent"),
+        position.get("profit_percent"),
+    )
+
+
+def _change_percent_source(data: XTBSnapshot, symbol: str) -> str | None:
+    quote = data.quotes.get(symbol, {})
+    position = _position_for_symbol(data.positions, symbol) or {}
+    candidates = (
+        ("quote_daily_change_percent", quote.get("daily_change_percent")),
+        ("position_daily_change_percent", position.get("daily_change_percent")),
+        ("quote_change_percent", quote.get("change_percent")),
+        ("position_price_change_percent", position.get("price_change_percent")),
+        ("position_profit_loss_percent", position.get("profit_loss_percent")),
+        ("position_profit_percent", position.get("profit_percent")),
+    )
+    for source, value in candidates:
+        if value is not None:
+            return source
+    return None
+
+
+def _first_present(*values: Any) -> Any:
+    for value in values:
+        if value is not None:
+            return value
     return None
 
 

@@ -52,7 +52,11 @@ class XTBInvestmentsCard extends HTMLElement {
     const orders = Array.isArray(attrs.orders) ? attrs.orders : [];
     const quotes = Object.values(attrs.quotes || {});
     const currency = summary.currency || attrs.unit_of_measurement || "";
-    const accountValue = summary.balance ?? summary.account_value ?? summary.portfolio_value ?? state.state;
+    const calculatedAccountValue =
+      Number.isFinite(Number(summary.cash_balance)) && Number.isFinite(Number(summary.asset_value))
+        ? Number(summary.cash_balance) + Number(summary.asset_value)
+        : undefined;
+    const accountValue = summary.account_value ?? summary.portfolio_value ?? calculatedAccountValue ?? summary.balance ?? state.state;
     const profit = Number(summary.profit_net ?? summary.position_profit_net ?? 0);
     const profitClass = profit >= 0 ? "positive" : "negative";
 
@@ -96,7 +100,7 @@ class XTBInvestmentsCard extends HTMLElement {
                     const positionProfit = position.profit_loss ?? position.profit_net;
                     return `
                       <tr>
-                        <td class="strong">${this.escape(position.symbol)}</td>
+                        <td class="strong">${this.escape(this.instrumentName(position))}</td>
                         <td>${this.number(position.volume)}</td>
                         <td>${this.money(position.market_value, currency)}</td>
                         <td class="${Number(position.daily_change_percent || 0) >= 0 ? "positive" : "negative"}">
@@ -121,7 +125,7 @@ class XTBInvestmentsCard extends HTMLElement {
                   ["Symbol", "Bid", "Ask", "Spread", "Dzień"],
                   (quote) => `
                     <tr>
-                      <td class="strong">${this.escape(quote.symbol)}</td>
+                      <td class="strong">${this.escape(this.instrumentName(quote))}</td>
                       <td>${this.number(quote.bid)}</td>
                       <td>${this.number(quote.ask)}</td>
                       <td>${this.number(quote.spread)}</td>
@@ -191,6 +195,10 @@ class XTBInvestmentsCard extends HTMLElement {
         </div>
       </section>
     `;
+  }
+
+  instrumentName(item) {
+    return item.display_name || item.name || item.description || item.symbol || "";
   }
 
   money(value, currency) {
