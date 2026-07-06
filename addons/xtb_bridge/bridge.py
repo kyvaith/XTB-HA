@@ -15,6 +15,7 @@ import json
 import logging
 import os
 from pathlib import Path
+import re
 import secrets
 import stat
 import time
@@ -23,14 +24,17 @@ from typing import Any
 from aiohttp import web
 
 from xtb_api import XTBClient
+from xtb_api.auth.browser_auth import BrowserCASAuth, LOGIN_URL, OTP_WAIT_TIMEOUT, _STEALTH_JS
 from xtb_api.auth.cas_client import CASClient, CASClientConfig
 from xtb_api.exceptions import CASError
 from xtb_api.types.websocket import CASLoginSuccess, CASLoginTwoFactorRequired
 
 DATA_DIR = Path(os.environ.get("XTB_BRIDGE_DATA", "/data"))
 SESSION_DIR = DATA_DIR / "sessions"
+DEBUG_DIR = DATA_DIR / "debug"
 DEFAULT_PORT = 8765
 PENDING_LOGIN_TTL_SECONDS = 300
+BROWSER_LOGIN_TIMEOUT_SECONDS = int(os.environ.get("XTB_BROWSER_LOGIN_TIMEOUT", "90"))
 
 logging.basicConfig(
     level=os.environ.get("LOG_LEVEL", "INFO"),
@@ -116,6 +120,267 @@ class PendingLogin:
     challenge: CASLoginTwoFactorRequired
     browser_auth: bool
     expires_at: float
+
+
+class ResilientBrowserCASAuth(BrowserCASAuth):
+    """Browser login flow with UI-based OTP detection and better diagnostics."""
+
+    async def login(self, email: str, password: str) -> CASLoginSuccess | CASLoginTwoFactorRequired:
+        try:
+            from playwright.async_api import Error as PlaywrightError
+            from playwright.async_api import async_playwright
+        except ImportError as err:
+            raise CASError(
+                "BROWSER_AUTH_MISSING_DEPENDENCY",
+                "Playwright is required for browser auth.",
+            ) from err
+
+        needs_cleanup = True
+        self._playwright = await async_playwright().start()
+        try:
+            try:
+                self._browser = await self._playwright.chromium.launch(
+                    headless=self._headless,
+                    args=[
+                        "--disable-blink-features=AutomationControlled",
+                        "--disable-dev-shm-usage",
+                        "--no-sandbox",
+                    ],
+                )
+            except PlaywrightError as err:
+                raise CASError("BROWSER_CHROMIUM_FAILED", str(err)) from err
+
+            context = await self._browser.new_context(
+                user_agent=(
+                    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                    "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+                ),
+                locale="pl-PL",
+                timezone_id="Europe/Warsaw",
+            )
+            await context.add_init_script(_STEALTH_JS)
+
+            self._page = await context.new_page()
+            self._page.on("response", self._on_response)
+
+            fingerprint = hashlib.sha256(b"xStation5/2.94.1 (Linux x86_64)").hexdigest().upper()
+            await context.add_init_script(
+                f"""
+                try {{
+                    localStorage.setItem('deviceFingerprint', '{fingerprint}');
+                    localStorage.setItem('fingerprint', '{fingerprint}');
+                }} catch(e) {{}}
+                """
+            )
+
+            LOGGER.info("Navigating browser to %s", LOGIN_URL)
+            await self._page.goto(LOGIN_URL, wait_until="commit", timeout=30_000)
+
+            email_input = self._page.get_by_role("textbox").first
+            await email_input.wait_for(state="visible", timeout=30_000)
+            LOGGER.info("Browser login form found")
+
+            await email_input.click()
+            await email_input.fill("")
+            await self._page.keyboard.type(email, delay=30)
+
+            password_input = self._page.get_by_role("textbox").nth(1)
+            await password_input.click()
+            await password_input.fill("")
+            await self._page.keyboard.type(password, delay=30)
+
+            await self._page.wait_for_timeout(300)
+            await self._submit_login_form(password_input)
+            LOGGER.info("Browser login form submitted")
+
+            tgt_task = asyncio.create_task(self._tgt_event.wait())
+            response_2fa_task = asyncio.create_task(self._two_factor_detected.wait())
+            ui_2fa_task = asyncio.create_task(self._wait_for_otp_ui())
+            error_task = asyncio.create_task(self._wait_for_login_error())
+
+            done, pending = await asyncio.wait(
+                {tgt_task, response_2fa_task, ui_2fa_task, error_task},
+                timeout=BROWSER_LOGIN_TIMEOUT_SECONDS,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            for task in pending:
+                task.cancel()
+
+            if self._tgt:
+                await self.close()
+                return CASLoginSuccess(tgt=self._tgt, expires_at=time.time() + 8 * 3600)
+
+            if response_2fa_task in done or (ui_2fa_task in done and ui_2fa_task.result()):
+                needs_cleanup = False
+                info = self._two_factor_info or {}
+                login_ticket = self._login_ticket or "browser-2fa"
+                return CASLoginTwoFactorRequired(
+                    login_ticket=login_ticket,
+                    session_id=login_ticket,
+                    two_factor_auth_type=info.get("twoFactorAuthType", "SMS"),
+                    methods=[info.get("twoFactorAuthType", "SMS")],
+                    expires_at=time.time() + OTP_WAIT_TIMEOUT,
+                )
+
+            if error_task in done and (message := error_task.result()):
+                raise CASError("BROWSER_AUTH_REJECTED", message)
+
+            await self._save_debug_artifacts("login-timeout")
+            raise CASError(
+                "BROWSER_AUTH_TIMEOUT",
+                f"Login timed out after {BROWSER_LOGIN_TIMEOUT_SECONDS}s - no TGT or OTP screen detected",
+            )
+        except BaseException:
+            if needs_cleanup:
+                await self.close()
+            raise
+
+    async def submit_otp(self, code: str) -> CASLoginSuccess:
+        if not self._page:
+            raise CASError("BROWSER_AUTH_NO_PAGE", "Browser page not available")
+
+        try:
+            LOGGER.info("Submitting OTP code via browser")
+            otp_input = await self._find_visible_otp_input(timeout_ms=30_000)
+            await otp_input.fill(code)
+
+            button = self._page.get_by_role(
+                "button",
+                name=re.compile(r"(verify|verification|submit|continue|potwier|weryfik|dalej)", re.I),
+            )
+            if await button.first.is_visible(timeout=3000):
+                await button.first.click()
+            else:
+                await otp_input.press("Enter")
+
+            try:
+                await asyncio.wait_for(self._tgt_event.wait(), timeout=60)
+            except TimeoutError as err:
+                await self._save_debug_artifacts("otp-timeout")
+                raise CASError("BROWSER_AUTH_OTP_TIMEOUT", "Timed out waiting for TGT after OTP") from err
+
+            if not self._tgt:
+                raise CASError("BROWSER_AUTH_NO_TGT", "OTP submitted but no TGT received")
+            return CASLoginSuccess(tgt=self._tgt, expires_at=time.time() + 8 * 3600)
+        finally:
+            await self.close()
+
+    async def _on_response(self, response) -> None:
+        try:
+            url = response.url
+            if "v2/tickets" in url and "serviceTicket" not in url:
+                body = None
+                with contextlib.suppress(Exception):
+                    body = await response.json()
+                if isinstance(body, dict):
+                    login_phase = body.get("loginPhase")
+                    ticket = body.get("ticket") or body.get("tgt")
+
+                    if login_phase == "TGT_CREATED" and ticket and ticket.startswith("TGT-"):
+                        LOGGER.info("TGT intercepted from v2/tickets response")
+                        self._tgt = ticket
+                        self._tgt_event.set()
+                        return
+
+                    if login_phase == "TWO_FACTOR_REQUIRED":
+                        self._login_ticket = (
+                            body.get("ticket") or body.get("loginTicket") or body.get("sessionId") or ""
+                        )
+                        self._two_factor_info = body
+                        self._two_factor_detected.set()
+                        LOGGER.info("2FA required according to v2/tickets response")
+                        return
+
+            set_cookie = response.headers.get("set-cookie", "")
+            if "CASTGT=" in set_cookie:
+                for part in set_cookie.split(";"):
+                    part = part.strip()
+                    if part.startswith("CASTGT="):
+                        tgt = part[len("CASTGT=") :]
+                        if tgt.startswith("TGT-"):
+                            LOGGER.info("TGT intercepted from CASTGT cookie")
+                            self._tgt = tgt
+                            self._tgt_event.set()
+                            return
+        except Exception as err:  # noqa: BLE001
+            LOGGER.debug("Error intercepting browser response: %s", err)
+
+    async def _submit_login_form(self, password_input) -> None:
+        for name in ("Login", "Log in", "Sign in", "Zaloguj", "Zaloguj sie"):
+            button = self._page.get_by_role("button", name=name)
+            if await button.is_visible(timeout=1000):
+                await button.click()
+                return
+        await password_input.press("Enter")
+
+    async def _wait_for_otp_ui(self) -> bool:
+        deadline = time.monotonic() + BROWSER_LOGIN_TIMEOUT_SECONDS
+        while time.monotonic() < deadline:
+            if self._tgt_event.is_set() or self._two_factor_detected.is_set():
+                return self._two_factor_detected.is_set()
+            with contextlib.suppress(Exception):
+                await self._find_visible_otp_input(timeout_ms=500)
+                LOGGER.info("OTP screen detected from browser UI")
+                return True
+            with contextlib.suppress(Exception):
+                body = (await self._page.locator("body").inner_text(timeout=500)).lower()
+                if ("otp" in body or "sms" in body or "kod" in body) and (
+                    "weryfik" in body or "code" in body or "verification" in body
+                ):
+                    LOGGER.info("OTP screen text detected from browser UI")
+                    return True
+            await asyncio.sleep(0.5)
+        return False
+
+    async def _wait_for_login_error(self) -> str | None:
+        deadline = time.monotonic() + BROWSER_LOGIN_TIMEOUT_SECONDS
+        patterns = (
+            "invalid",
+            "incorrect",
+            "nieprawid",
+            "bled",
+            "wrong",
+            "zablok",
+        )
+        while time.monotonic() < deadline:
+            if self._tgt_event.is_set() or self._two_factor_detected.is_set():
+                return None
+            with contextlib.suppress(Exception):
+                body = (await self._page.locator("body").inner_text(timeout=500)).lower()
+                for pattern in patterns:
+                    if pattern in body:
+                        return "XTB rejected the login form. Check login/password or account status."
+            await asyncio.sleep(1)
+        return None
+
+    async def _find_visible_otp_input(self, *, timeout_ms: int):
+        locators = [
+            self._page.get_by_placeholder(re.compile(r"(otp|code|kod)", re.I)),
+            self._page.locator("input[inputmode='numeric']"),
+            self._page.locator("input[type='tel']"),
+            self._page.locator("input[autocomplete='one-time-code']"),
+            self._page.locator("input[maxlength='6']"),
+        ]
+        per_locator_timeout = max(250, min(timeout_ms // len(locators), 2000))
+        deadline = time.monotonic() + timeout_ms / 1000
+        while time.monotonic() < deadline:
+            for locator in locators:
+                candidate = locator.first
+                if await candidate.is_visible(timeout=per_locator_timeout):
+                    return candidate
+            await asyncio.sleep(0.25)
+        raise CASError("BROWSER_AUTH_NO_OTP_INPUT", "OTP input was not visible")
+
+    async def _save_debug_artifacts(self, prefix: str) -> None:
+        if not self._page:
+            return
+        DEBUG_DIR.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
+        base = DEBUG_DIR / f"{prefix}-{stamp}"
+        with contextlib.suppress(Exception):
+            await self._page.screenshot(path=str(base.with_suffix(".png")), full_page=True)
+        with contextlib.suppress(Exception):
+            base.with_suffix(".html").write_text(await self._page.content(), encoding="utf-8")
 
 
 async def health(_request: web.Request) -> web.Response:
@@ -289,10 +554,19 @@ async def _login_with_fallback(
         if "UNAUTHORIZED" in err.code:
             raise
         LOGGER.info("REST CAS login failed (%s), trying browser fallback", err.code)
-        return await cas.login_with_browser(email, password), True
+        return await _login_with_browser(cas, email, password), True
     except Exception as err:
         LOGGER.info("REST CAS login failed (%s), trying browser fallback", err)
-        return await cas.login_with_browser(email, password), True
+        return await _login_with_browser(cas, email, password), True
+
+
+async def _login_with_browser(
+    cas: CASClient,
+    email: str,
+    password: str,
+) -> CASLoginSuccess | CASLoginTwoFactorRequired:
+    cas._browser_auth = ResilientBrowserCASAuth(headless=True)
+    return await cas._browser_auth.login(email, password)
 
 
 async def _discover_account_number(email: str, password: str) -> int:
@@ -632,6 +906,7 @@ def main() -> None:
     SESSION_DIR.mkdir(parents=True, exist_ok=True)
     app = web.Application()
     app.router.add_get("/health", health)
+    app.router.add_get("/", health)
     app.router.add_post("/login/start", login_start)
     app.router.add_post("/login/complete", login_complete)
     app.router.add_post("/snapshot", snapshot)

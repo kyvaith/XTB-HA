@@ -27,6 +27,7 @@ This repository starts as a Home Assistant custom integration, not a trading bot
 - The add-on auto-detects the XTB account number after login.
 - Setup is intentionally simple: login and password first, then a one-time OTP step only if XTB asks for it.
 - Includes brand assets for Home Assistant, HACS and the add-on store.
+- Uses a resilient browser login flow in the bridge for XTB's WAF and OTP screens.
 - Home Assistant polls one normalized account snapshot through a `DataUpdateCoordinator`.
 - Exposes aggregate sensors for equity, balance, free margin, open profit, open position count and pending order count.
 - Stores detailed positions, orders, quotes and account summary as attributes on the portfolio sensor.
