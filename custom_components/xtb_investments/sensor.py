@@ -37,13 +37,13 @@ class XTBSensorDescription(SensorEntityDescription):
 
 SENSORS: tuple[XTBSensorDescription, ...] = (
     XTBSensorDescription(
-        key="portfolio",
-        translation_key="portfolio",
-        icon="mdi:briefcase",
+        key="balance",
+        translation_key="balance",
+        icon="mdi:cash",
         device_class=SensorDeviceClass.MONETARY,
         state_class=SensorStateClass.MEASUREMENT,
         currency_unit=True,
-        value_fn=lambda data: data.summary.get("portfolio_value"),
+        value_fn=lambda data: data.summary.get("balance"),
         attrs_fn=lambda data: {
             "account": data.account,
             "summary": data.summary,
@@ -56,22 +56,17 @@ SENSORS: tuple[XTBSensorDescription, ...] = (
         },
     ),
     XTBSensorDescription(
-        key="balance",
-        translation_key="balance",
-        icon="mdi:cash",
-        device_class=SensorDeviceClass.MONETARY,
-        state_class=SensorStateClass.MEASUREMENT,
-        currency_unit=True,
-        value_fn=lambda data: data.summary.get("cash_balance"),
-    ),
-    XTBSensorDescription(
         key="free_margin",
         translation_key="free_margin",
         icon="mdi:cash-check",
         device_class=SensorDeviceClass.MONETARY,
         state_class=SensorStateClass.MEASUREMENT,
         currency_unit=True,
-        value_fn=lambda data: data.summary.get("free_margin"),
+        value_fn=lambda data: (
+            data.summary.get("cash_balance")
+            if data.summary.get("cash_balance") is not None
+            else data.summary.get("free_margin")
+        ),
     ),
     XTBSensorDescription(
         key="profit",
@@ -136,6 +131,9 @@ async def async_setup_entry(
     for symbol in sorted(coordinator.data.quotes):
         entities.append(XTBQuoteSensor(coordinator, entry, symbol))
 
+    for index, position in enumerate(coordinator.data.positions):
+        entities.append(XTBPositionProfitSensor(coordinator, entry, position, index))
+
     async_add_entities(entities)
 
 
@@ -194,32 +192,120 @@ class XTBAggregateSensor(XTBBaseSensor):
 
 
 class XTBQuoteSensor(XTBBaseSensor):
-    """Quote sensor for a watched or open-position symbol."""
+    """Daily percent change sensor for a watched or open-position symbol."""
 
-    _attr_icon = "mdi:chart-timeline-variant"
+    _attr_icon = "mdi:percent"
+    _attr_native_unit_of_measurement = PERCENTAGE
     _attr_state_class = SensorStateClass.MEASUREMENT
 
     def __init__(self, coordinator: XTBCoordinator, entry: ConfigEntry, symbol: str) -> None:
         super().__init__(coordinator, entry)
         self._symbol = symbol
         self._attr_unique_id = f"{entry.entry_id}_quote_{symbol.lower().replace('.', '_')}"
-        self._attr_name = symbol
+        self._attr_name = f"{symbol} dzienna zmiana"
 
     @property
     def native_value(self) -> StateValue:
         quote = self.coordinator.data.quotes.get(self._symbol, {})
-        return quote.get("mid") or quote.get("bid")
+        if quote.get("daily_change_percent") is not None:
+            return quote.get("daily_change_percent")
+
+        position = _position_for_symbol(self.coordinator.data.positions, self._symbol)
+        return position.get("daily_change_percent") if position else None
 
     @property
     def available(self) -> bool:
-        return super().available and bool(
-            self.coordinator.data.quotes.get(self._symbol, {}).get("available")
-        )
+        return super().available and self.native_value is not None
 
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
         quote = self.coordinator.data.quotes.get(self._symbol, {})
+        position = _position_for_symbol(self.coordinator.data.positions, self._symbol)
         return {
             **quote,
+            "position_profit_loss": position.get("profit_loss") if position else None,
+            "position_market_value": position.get("market_value") if position else None,
+            "currency": self.coordinator.data.summary.get("currency"),
             "attribution": ATTRIBUTION,
         }
+
+
+class XTBPositionProfitSensor(XTBBaseSensor):
+    """Profit/loss sensor for one open position."""
+
+    _attr_icon = "mdi:chart-line"
+    _attr_device_class = SensorDeviceClass.MONETARY
+    _attr_state_class = SensorStateClass.MEASUREMENT
+
+    def __init__(
+        self,
+        coordinator: XTBCoordinator,
+        entry: ConfigEntry,
+        position: dict[str, Any],
+        index: int,
+    ) -> None:
+        super().__init__(coordinator, entry)
+        self._position_key = _position_key(position, index)
+        symbol = str(position.get("symbol") or f"pozycja {index + 1}")
+        self._attr_unique_id = f"{entry.entry_id}_position_profit_{self._position_key}"
+        self._attr_name = f"{symbol} zysk/strata"
+
+    @property
+    def native_value(self) -> StateValue:
+        position = self._current_position()
+        if position is None:
+            return None
+        return position.get("profit_loss") if position.get("profit_loss") is not None else position.get("profit_net")
+
+    @property
+    def native_unit_of_measurement(self) -> str | None:
+        return self.coordinator.data.summary.get("currency") or None
+
+    @property
+    def available(self) -> bool:
+        return super().available and self._current_position() is not None
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        position = self._current_position() or {}
+        return {
+            "symbol": position.get("symbol"),
+            "account_number": position.get("account_number"),
+            "daily_change_percent": position.get("daily_change_percent"),
+            "profit_loss_percent": position.get("profit_loss_percent") or position.get("profit_percent"),
+            "market_value": position.get("market_value"),
+            "volume": position.get("volume"),
+            "currency": self.coordinator.data.summary.get("currency"),
+            "attribution": ATTRIBUTION,
+        }
+
+    def _current_position(self) -> dict[str, Any] | None:
+        for index, position in enumerate(self.coordinator.data.positions):
+            if _position_key(position, index) == self._position_key:
+                return position
+        return None
+
+
+def _position_for_symbol(
+    positions: list[dict[str, Any]],
+    symbol: str,
+) -> dict[str, Any] | None:
+    target = symbol.upper()
+    for position in positions:
+        if str(position.get("symbol") or "").upper() == target:
+            return position
+    return None
+
+
+def _position_key(position: dict[str, Any], index: int) -> str:
+    raw_key = "_".join(
+        str(part)
+        for part in (
+            position.get("account_number"),
+            position.get("order_id"),
+            position.get("symbol"),
+            index,
+        )
+        if part not in (None, "")
+    )
+    return "".join(char if char.isalnum() else "_" for char in raw_key.lower()).strip("_")

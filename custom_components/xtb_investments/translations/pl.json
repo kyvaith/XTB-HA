@@ -31,14 +31,11 @@
   },
   "entity": {
     "sensor": {
-      "portfolio": {
-        "name": "Portfel"
-      },
       "balance": {
         "name": "Saldo"
       },
       "free_margin": {
-        "name": "Wolny margin"
+        "name": "Wolne środki"
       },
       "profit": {
         "name": "Zysk"
@@ -53,7 +50,7 @@
         "name": "Zlecenia oczekujące"
       },
       "quote": {
-        "name": "{symbol}"
+        "name": "{symbol} dzienna zmiana"
       }
     }
   }

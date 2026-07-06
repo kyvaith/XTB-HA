@@ -23,7 +23,7 @@ class XTBInvestmentsCard extends HTMLElement {
 
   static getStubConfig() {
     return {
-      entity: "sensor.xtb_portfolio",
+      entity: "sensor.xtb_balance",
       show_positions: true,
       show_quotes: true,
       show_orders: true,
@@ -52,7 +52,7 @@ class XTBInvestmentsCard extends HTMLElement {
     const orders = Array.isArray(attrs.orders) ? attrs.orders : [];
     const quotes = Object.values(attrs.quotes || {});
     const currency = summary.currency || attrs.unit_of_measurement || "";
-    const portfolioValue = summary.portfolio_value ?? summary.account_value ?? state.state;
+    const accountValue = summary.balance ?? summary.account_value ?? summary.portfolio_value ?? state.state;
     const profit = Number(summary.profit_net ?? summary.position_profit_net ?? 0);
     const profitClass = profit >= 0 ? "positive" : "negative";
 
@@ -62,15 +62,15 @@ class XTBInvestmentsCard extends HTMLElement {
           <header class="xtb-header">
             <div>
               <div class="eyebrow">XTB</div>
-              <h2>Portfel</h2>
+              <h2>Saldo</h2>
             </div>
             <div class="updated">${this.formatDate(attrs.updated_at)}</div>
           </header>
 
           <section class="hero">
             <div>
-              <div class="label">Wartość portfela</div>
-              <div class="equity">${this.money(portfolioValue, currency)}</div>
+              <div class="label">Wartość konta</div>
+              <div class="equity">${this.money(accountValue, currency)}</div>
             </div>
             <div class="profit ${profitClass}">
               <ha-icon icon="${profit >= 0 ? "mdi:trending-up" : "mdi:trending-down"}"></ha-icon>
@@ -80,7 +80,7 @@ class XTBInvestmentsCard extends HTMLElement {
           </section>
 
           <section class="metrics">
-            ${this.metric("Saldo", this.money(summary.cash_balance ?? summary.balance, currency), "mdi:cash")}
+            ${this.metric("Wolne środki", this.money(summary.cash_balance, currency), "mdi:cash")}
             ${this.metric("Aktywa", this.money(summary.asset_value, currency), "mdi:briefcase-check")}
             ${this.metric("Pozycje", summary.open_positions ?? positions.length, "mdi:format-list-bulleted")}
             ${this.metric("Zlecenia", summary.pending_orders ?? orders.length, "mdi:clipboard-clock")}
@@ -484,5 +484,5 @@ window.customCards = window.customCards || [];
 window.customCards.push({
   type: "xtb-investments-card",
   name: "XTB Investments Card",
-  description: "XTB portfolio, positions, orders and quotes",
+  description: "XTB account balance, positions, orders and daily changes",
 });

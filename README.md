@@ -30,8 +30,9 @@ This repository starts as a Home Assistant custom integration, not a trading bot
 - Uses a resilient browser login flow in the bridge for XTB's WAF and OTP screens.
 - Lets Home Assistant track a selected XTB account and automatically includes related real accounts in the same currency, such as PLN IKZE alongside the main PLN account.
 - Home Assistant polls one normalized investment snapshot through a `DataUpdateCoordinator`.
-- Exposes aggregate sensors for portfolio value, cash balance, free margin, total profit, profit percent, open position count and pending order count.
-- Stores detailed positions, orders, quotes and account summary as attributes on the portfolio sensor.
+- Exposes aggregate sensors for account balance, free funds, total profit, profit percent, open position count and pending order count.
+- Stores detailed positions, orders, quotes and account summary as attributes on the balance sensor.
+- Creates symbol daily-change sensors and per-position profit/loss sensors.
 - Adds a dashboard card at `custom_components/xtb_investments/frontend/xtb-investments-card.js`.
 - Does not expose buy/sell/cancel services.
 
@@ -68,28 +69,28 @@ Example card:
 
 ```yaml
 type: custom:xtb-investments-card
-entity: sensor.xtb_portfolio
+entity: sensor.xtb_balance
 show_positions: true
 show_quotes: true
 show_orders: true
 ```
 
-Use the actual portfolio entity ID created by Home Assistant if it differs from the example.
+Use the actual balance entity ID created by Home Assistant if it differs from the example.
 
 ## Entities
 
 The integration creates:
 
-- Portfolio sensor with full snapshot attributes and the account value shown by XTB
-- Balance sensor for cash/free funds
-- Free margin sensor
+- Balance sensor with the account value shown by XTB and full snapshot attributes
+- Free funds sensor
 - Profit sensor
 - Profit percent sensor
 - Open positions count sensor, disabled by default as a diagnostic entity
 - Pending orders count sensor, disabled by default as a diagnostic entity
-- Quote sensors for symbols in the initial setup snapshot
+- Daily percent change sensors for symbols in the initial setup snapshot
+- Profit/loss sensors for open positions in the initial setup snapshot
 
-New symbols from later-opened positions still appear in the portfolio sensor attributes and card after refresh. Reload the integration if you also want separate quote entities for them.
+New symbols from later-opened positions still appear in the balance sensor attributes and card after refresh. Reload the integration if you also want separate symbol or position entities for them.
 
 ## Safety
 

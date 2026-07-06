@@ -31,14 +31,11 @@
   },
   "entity": {
     "sensor": {
-      "portfolio": {
-        "name": "Portfolio"
-      },
       "balance": {
         "name": "Balance"
       },
       "free_margin": {
-        "name": "Free margin"
+        "name": "Free funds"
       },
       "profit": {
         "name": "Profit"
@@ -53,7 +50,7 @@
         "name": "Pending orders"
       },
       "quote": {
-        "name": "{symbol}"
+        "name": "{symbol} daily change"
       }
     }
   }

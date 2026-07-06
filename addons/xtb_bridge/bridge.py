@@ -1294,13 +1294,13 @@ def _build_summary(
     quotes: dict[str, dict[str, Any]],
 ) -> dict[str, Any]:
     cash_balance = _float(account.get("cash_balance"))
-    balance = cash_balance if cash_balance is not None else _float(account.get("balance"))
+    cash_funds = cash_balance if cash_balance is not None else _float(account.get("balance"))
     equity = _float(account.get("equity"))
     free_margin = _float(account.get("free_margin"))
     portfolio_value = _float(account.get("portfolio_value"))
     asset_value = _float(account.get("asset_value"))
     if portfolio_value is None:
-        portfolio_value = equity if equity is not None else balance
+        portfolio_value = equity if equity is not None else cash_funds
 
     used_margin = (
         max(equity - free_margin, 0.0)
@@ -1334,8 +1334,8 @@ def _build_summary(
         "currency": account.get("currency") or "",
         "portfolio_value": _rounded(portfolio_value),
         "account_value": _rounded(portfolio_value),
-        "balance": _rounded(balance),
-        "cash_balance": _rounded(balance),
+        "balance": _rounded(portfolio_value),
+        "cash_balance": _rounded(cash_funds),
         "equity": _rounded(equity),
         "free_margin": _rounded(free_margin),
         "asset_value": _rounded(asset_value),
