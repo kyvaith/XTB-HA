@@ -89,12 +89,12 @@ If XTB returns more than one account, Home Assistant shows an account selection 
 
 The integration registers `/xtb_investments/xtb-investments-card.js?v=<version>` as a JavaScript module resource automatically. Refresh the browser after updating the integration so the Home Assistant frontend reloads the card picker.
 
-The card shows the account value, total monetary and percentage profit, the last update time and a compact positions table. Positions are sorted from the largest to the smallest monetary profit/loss. The positions table intentionally shows only instrument name, daily percent change and monetary profit/loss; cash/free-funds metrics and the separate quotes table are omitted to keep the dashboard card dense.
+The card shows the account value, total monetary and percentage profit, the last update time and a compact positions table. Positions are sorted from the largest to the smallest monetary profit/loss. Each instrument has a small graphical marker: a real icon is used when XTB metadata exposes one, otherwise the card renders a deterministic ticker avatar. The positions table intentionally shows only instrument name, daily percent change and monetary profit/loss; cash/free-funds metrics and the separate quotes table are omitted to keep the dashboard card dense.
 
 If your dashboard is in YAML mode or HA blocks automatic resource writes, add this module resource manually:
 
 ```yaml
-url: /xtb_investments/xtb-investments-card.js?v=0.1.11
+url: /xtb_investments/xtb-investments-card.js?v=0.1.12
 type: module
 ```
 

@@ -102,7 +102,12 @@ class XTBInvestmentsCard extends HTMLElement {
                     const positionProfit = this.positionProfit(position);
                     return `
                       <tr>
-                        <td class="strong">${this.escape(this.instrumentName(position))}</td>
+                        <td class="strong">
+                          <div class="instrument">
+                            ${this.instrumentMark(position)}
+                            <span class="instrument-name">${this.escape(this.instrumentName(position))}</span>
+                          </div>
+                        </td>
                         <td class="${Number(position.daily_change_percent || 0) >= 0 ? "positive" : "negative"}">
                           ${this.percent(position.daily_change_percent)}
                         </td>
@@ -167,6 +172,83 @@ class XTBInvestmentsCard extends HTMLElement {
 
   instrumentName(item) {
     return item.display_name || item.name || item.description || item.symbol || "";
+  }
+
+  instrumentMark(item) {
+    const iconUrl = this.instrumentIconUrl(item);
+    if (iconUrl) {
+      return `
+        <span class="instrument-avatar image" aria-hidden="true">
+          <img src="${this.escape(iconUrl)}" alt="">
+        </span>
+      `;
+    }
+
+    const key = item.symbol || this.instrumentName(item);
+    return `
+      <span class="instrument-avatar" style="${this.avatarStyle(key)}" aria-hidden="true">
+        ${this.escape(this.instrumentInitials(item))}
+      </span>
+    `;
+  }
+
+  instrumentIconUrl(item) {
+    const value =
+      item.icon_url ||
+      item.logo_url ||
+      item.image_url ||
+      item.iconUrl ||
+      item.logoUrl ||
+      item.imageUrl;
+    const url = String(value || "").trim();
+    if (
+      url.startsWith("https://") ||
+      url.startsWith("http://") ||
+      url.startsWith("/") ||
+      url.startsWith("data:image/")
+    ) {
+      return url;
+    }
+    return "";
+  }
+
+  instrumentInitials(item) {
+    const symbol = String(item.symbol || "").trim();
+    const ticker = symbol.split(".")[0].replace(/[^a-z0-9]/gi, "").slice(0, 4);
+    if (ticker) {
+      return ticker.toUpperCase();
+    }
+
+    const words = this.instrumentName(item)
+      .replace(/\b(CFD|GDR|SA|S\.A\.|PLC|LTD|CO|CLASS|ONLY)\b/gi, " ")
+      .match(/[a-z0-9]+/gi);
+    if (!words || !words.length) {
+      return "XTB";
+    }
+    return words
+      .slice(0, 2)
+      .map((word) => word[0])
+      .join("")
+      .toUpperCase();
+  }
+
+  avatarStyle(value) {
+    const palette = [
+      "#0f766e",
+      "#2563eb",
+      "#b45309",
+      "#be123c",
+      "#4f46e5",
+      "#15803d",
+      "#0369a1",
+      "#c2410c",
+    ];
+    const text = String(value || "");
+    let hash = 0;
+    for (let index = 0; index < text.length; index += 1) {
+      hash = (hash * 31 + text.charCodeAt(index)) >>> 0;
+    }
+    return `--avatar-bg: ${palette[hash % palette.length]}`;
   }
 
   positionProfit(position) {
@@ -392,6 +474,48 @@ class XTBInvestmentsCard extends HTMLElement {
 
         .strong {
           font-weight: 650;
+          overflow: hidden;
+          text-overflow: ellipsis;
+        }
+
+        .instrument {
+          display: flex;
+          align-items: center;
+          gap: 8px;
+          min-width: 0;
+        }
+
+        .instrument-avatar {
+          display: inline-flex;
+          align-items: center;
+          justify-content: center;
+          flex: 0 0 24px;
+          width: 24px;
+          height: 24px;
+          overflow: hidden;
+          border: 1px solid color-mix(in srgb, var(--divider-color) 70%, transparent);
+          border-radius: 6px;
+          background: var(--avatar-bg, #246b8f);
+          color: #fff;
+          font-size: 9px;
+          font-weight: 800;
+          line-height: 1;
+          letter-spacing: 0;
+        }
+
+        .instrument-avatar.image {
+          background: color-mix(in srgb, var(--primary-text-color) 8%, transparent);
+        }
+
+        .instrument-avatar img {
+          display: block;
+          width: 100%;
+          height: 100%;
+          object-fit: cover;
+        }
+
+        .instrument-name {
+          min-width: 0;
           overflow: hidden;
           text-overflow: ellipsis;
         }

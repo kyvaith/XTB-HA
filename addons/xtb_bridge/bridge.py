@@ -1069,6 +1069,7 @@ async def _fetch_instrument_info(client: XTBClient, symbol: str) -> dict[str, An
         "name": name,
         "display_name": name,
         "description": description,
+        "icon_url": _instrument_icon_url(data),
         "symbol_key": _first_str(data, "symbol_key", "symbolKey"),
         "instrument_id": _int(_lookup_value(data, "instrument_id")),
         "bid": market_info.get("bid"),
@@ -1092,6 +1093,7 @@ def _apply_instrument_info(item: dict[str, Any], info: dict[str, Any] | None) ->
         "name",
         "display_name",
         "description",
+        "icon_url",
         "symbol_key",
         "instrument_id",
         "bid",
@@ -1334,6 +1336,7 @@ def _normalize_position(raw: Any, account: dict[str, Any]) -> dict[str, Any]:
         "name": _first_str(data, "name", "description", "displayName", "display_name", "instrumentName"),
         "display_name": _first_str(data, "displayName", "display_name", "name", "description", "instrumentName"),
         "description": _first_str(data, "description", "fullDescription", "full_description", "name"),
+        "icon_url": _instrument_icon_url(data),
         "side": side,
         "volume": volume,
         "current_price": _rounded(current_price),
@@ -1394,6 +1397,7 @@ def _normalize_order(raw: Any, account: dict[str, Any]) -> dict[str, Any]:
         "name": _first_str(data, "name", "description", "displayName", "display_name", "instrumentName"),
         "display_name": _first_str(data, "displayName", "display_name", "name", "description", "instrumentName"),
         "description": _first_str(data, "description", "fullDescription", "full_description", "name"),
+        "icon_url": _instrument_icon_url(data),
         "side": _normalize_side(_lookup_value(data, "side")),
         "volume": _first_float(data, "volume", "size", "amount") or 0.0,
         "price": _first_float(data, "openPrice", "open_price", "price") or 0.0,
@@ -1486,6 +1490,7 @@ def _normalize_quote(symbol: str, raw: Any) -> dict[str, Any]:
         "name": _first_str(data, "name", "description", "displayName", "display_name", "instrumentName"),
         "display_name": _first_str(data, "displayName", "display_name", "name", "description", "instrumentName"),
         "description": _first_str(data, "description", "fullDescription", "full_description", "name"),
+        "icon_url": _instrument_icon_url(data),
         "available": True,
         "bid": bid,
         "ask": ask,
@@ -1685,6 +1690,28 @@ def _first_str(data: dict[str, Any], *keys: str) -> str | None:
         value = _lookup_value(data, key)
         if value is not None and value != "":
             return str(value)
+    return None
+
+
+def _instrument_icon_url(data: dict[str, Any]) -> str | None:
+    value = _first_str(
+        data,
+        "icon_url",
+        "iconUrl",
+        "logo_url",
+        "logoUrl",
+        "image_url",
+        "imageUrl",
+        "badge_url",
+        "badgeUrl",
+        "symbol_icon_url",
+        "symbolIconUrl",
+    )
+    if value is None:
+        return None
+    value = value.strip()
+    if value.startswith(("https://", "http://", "/", "data:image/")):
+        return value
     return None
 
 
