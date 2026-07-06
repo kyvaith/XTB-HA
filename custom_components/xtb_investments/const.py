@@ -6,8 +6,13 @@ from homeassistant.const import Platform
 
 DOMAIN = "xtb_investments"
 NAME = "XTB Investments"
+VERSION = "0.1.7"
 
 PLATFORMS: list[Platform] = [Platform.SENSOR]
+
+CARD_FILENAME = "xtb-investments-card.js"
+CARD_RESOURCE_URL = f"/{DOMAIN}/{CARD_FILENAME}"
+CARD_RESOURCE_URL_VERSIONED = f"{CARD_RESOURCE_URL}?v={VERSION}"
 
 CONF_ACCOUNT_NUMBER = "account_number"
 CONF_BRIDGE_URL = "bridge_url"

@@ -33,7 +33,7 @@ This repository starts as a Home Assistant custom integration, not a trading bot
 - Exposes aggregate sensors for account balance, free funds, total profit, profit percent, open position count and pending order count.
 - Stores detailed positions, orders, quotes and account summary as attributes on the balance sensor.
 - Creates symbol daily-change sensors and per-position profit/loss sensors.
-- Adds a dashboard card at `custom_components/xtb_investments/frontend/xtb-investments-card.js`.
+- Adds a dashboard card at `custom_components/xtb_investments/frontend/xtb-investments-card.js` and registers it as a Lovelace module resource automatically.
 - Does not expose buy/sell/cancel services.
 
 ## Why the bridge exists
@@ -63,7 +63,14 @@ If XTB returns more than one account, Home Assistant shows an account selection 
 
 ## Dashboard card
 
-Add `/xtb_investments/xtb-investments-card.js` as a JavaScript module resource in Home Assistant dashboards. The path is served by the integration after HA loads it.
+The integration registers `/xtb_investments/xtb-investments-card.js?v=<version>` as a JavaScript module resource automatically. Refresh the browser after updating the integration so the Home Assistant frontend reloads the card picker.
+
+If your dashboard is in YAML mode or HA blocks automatic resource writes, add this module resource manually:
+
+```yaml
+url: /xtb_investments/xtb-investments-card.js?v=0.1.7
+type: module
+```
 
 Example card:
 
