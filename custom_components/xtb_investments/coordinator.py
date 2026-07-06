@@ -7,9 +7,10 @@ import logging
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import ConfigEntryAuthFailed
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
-from .api import XTBBridgeClient, XTBSnapshot
+from .api import XTBBridgeAuthRequired, XTBBridgeClient, XTBSnapshot
 from .const import CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL, DOMAIN, MIN_SCAN_INTERVAL
 
 _LOGGER = logging.getLogger(__name__)
@@ -46,5 +47,7 @@ class XTBCoordinator(DataUpdateCoordinator[XTBSnapshot]):
     async def _async_update_data(self) -> XTBSnapshot:
         try:
             return await self.client.async_get_snapshot()
+        except XTBBridgeAuthRequired as err:
+            raise ConfigEntryAuthFailed(str(err)) from err
         except Exception as err:
             raise UpdateFailed(str(err)) from err

@@ -12,7 +12,6 @@ from .api import XTBBridgeClient
 from .const import (
     CONF_BRIDGE_URL,
     CONF_EMAIL,
-    CONF_OTP,
     CONF_PASSWORD,
     DEFAULT_BRIDGE_URL,
     DOMAIN,
@@ -41,7 +40,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: XTBConfigEntry) -> bool:
         hass,
         email=entry.data[CONF_EMAIL],
         password=entry.data[CONF_PASSWORD],
-        otp=entry.data.get(CONF_OTP, ""),
         bridge_url=entry.data.get(CONF_BRIDGE_URL, DEFAULT_BRIDGE_URL),
     )
     coordinator = XTBCoordinator(hass, entry, client)

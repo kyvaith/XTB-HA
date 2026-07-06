@@ -7,41 +7,49 @@ does that in its own container and exposes a small localhost API.
 from __future__ import annotations
 
 import asyncio
-from dataclasses import asdict, is_dataclass
+import contextlib
+from dataclasses import asdict, dataclass, is_dataclass
 from datetime import UTC, datetime
 import hashlib
 import json
 import logging
 import os
 from pathlib import Path
+import secrets
+import stat
+import time
 from typing import Any
 
 from aiohttp import web
 
 from xtb_api import XTBClient
+from xtb_api.auth.cas_client import CASClient, CASClientConfig
+from xtb_api.exceptions import CASError
+from xtb_api.types.websocket import CASLoginSuccess, CASLoginTwoFactorRequired
 
 DATA_DIR = Path(os.environ.get("XTB_BRIDGE_DATA", "/data"))
 SESSION_DIR = DATA_DIR / "sessions"
 DEFAULT_PORT = 8765
+PENDING_LOGIN_TTL_SECONDS = 300
 
 logging.basicConfig(
     level=os.environ.get("LOG_LEVEL", "INFO"),
     format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
 )
 LOGGER = logging.getLogger("xtb_bridge")
+PENDING_LOCK = asyncio.Lock()
 
 
 class ManagedClient:
     """A cached XTB client with automatic account-number discovery."""
 
-    def __init__(self, *, email: str, password: str, otp: str) -> None:
+    def __init__(self, *, email: str, password: str) -> None:
         self.email = email
         self.password = password
-        self.otp = otp
         self.account_number: int | None = None
         self.client: XTBClient | None = None
         self.lock = asyncio.Lock()
-        self.session_file = SESSION_DIR / f"{_cache_key(email, password, otp)}.json"
+        self.session_file = _session_file(email, password)
 
     async def get_snapshot(self) -> dict[str, Any]:
         async with self.lock:
@@ -61,7 +69,6 @@ class ManagedClient:
             password=self.password,
             account_number=self.account_number,
             account_type="real",
-            totp_secret=self.otp,
             session_file=self.session_file,
         )
         await self.client.connect()
@@ -74,7 +81,6 @@ class ManagedClient:
             password=self.password,
             account_number=0,
             account_type="real",
-            totp_secret=self.otp,
             session_file=self.session_file,
         )
         try:
@@ -97,10 +103,100 @@ class ManagedClient:
 
 
 CLIENTS: dict[str, ManagedClient] = {}
+PENDING_LOGINS: dict[str, "PendingLogin"] = {}
+
+
+@dataclass
+class PendingLogin:
+    """A login challenge waiting for a one-time OTP code."""
+
+    email: str
+    password: str
+    cas: CASClient
+    challenge: CASLoginTwoFactorRequired
+    browser_auth: bool
+    expires_at: float
 
 
 async def health(_request: web.Request) -> web.Response:
     return web.json_response({"ok": True})
+
+
+async def login_start(request: web.Request) -> web.Response:
+    try:
+        payload = await request.json()
+    except json.JSONDecodeError:
+        return web.json_response({"error": "Invalid JSON"}, status=400)
+
+    email = str(payload.get("email") or "").strip()
+    password = str(payload.get("password") or "")
+
+    if not email or not password:
+        return web.json_response({"error": "Email and password are required"}, status=400)
+
+    await _cleanup_pending_logins()
+    cas = _new_cas(email)
+    try:
+        result, browser_auth = await _login_with_fallback(cas, email, password)
+    except Exception as err:  # noqa: BLE001
+        LOGGER.exception("Login start failed for %s", email)
+        await _close_cas(cas)
+        return web.json_response({"error": str(err)}, status=401)
+
+    return await _login_result_response(
+        email=email,
+        password=password,
+        cas=cas,
+        result=result,
+        browser_auth=browser_auth,
+    )
+
+
+async def login_complete(request: web.Request) -> web.Response:
+    try:
+        payload = await request.json()
+    except json.JSONDecodeError:
+        return web.json_response({"error": "Invalid JSON"}, status=400)
+
+    challenge_id = str(payload.get("challenge_id") or "").strip()
+    otp = str(payload.get("otp") or "").replace(" ", "")
+
+    if not challenge_id or not otp:
+        return web.json_response({"error": "Challenge ID and OTP are required"}, status=400)
+
+    await _cleanup_pending_logins()
+    async with PENDING_LOCK:
+        pending = PENDING_LOGINS.get(challenge_id)
+        if pending is None:
+            return web.json_response({"error": "OTP challenge expired. Start login again."}, status=410)
+
+    try:
+        if pending.browser_auth:
+            result = await pending.cas.submit_browser_otp(otp)
+        else:
+            result = await pending.cas.login_with_two_factor(
+                pending.challenge.login_ticket,
+                otp,
+                pending.challenge.two_factor_auth_type,
+                session_id=pending.challenge.session_id,
+            )
+    except Exception as err:  # noqa: BLE001
+        LOGGER.warning("OTP completion failed for %s: %s", pending.email, err)
+        return web.json_response({"error": str(err)}, status=401)
+
+    if isinstance(result, CASLoginTwoFactorRequired):
+        pending.challenge = result
+        pending.expires_at = min(result.expires_at, time.time() + PENDING_LOGIN_TTL_SECONDS)
+        return _otp_required_response(challenge_id, result)
+
+    PENDING_LOGINS.pop(challenge_id, None)
+    return await _login_result_response(
+        email=pending.email,
+        password=pending.password,
+        cas=pending.cas,
+        result=result,
+        browser_auth=False,
+    )
 
 
 async def snapshot(request: web.Request) -> web.Response:
@@ -111,15 +207,14 @@ async def snapshot(request: web.Request) -> web.Response:
 
     email = str(payload.get("email") or "").strip()
     password = str(payload.get("password") or "")
-    otp = str(payload.get("otp") or "").replace(" ", "")
 
     if not email or not password:
         return web.json_response({"error": "Email and password are required"}, status=400)
 
-    key = _cache_key(email, password, otp)
+    key = _cache_key(email, password)
     client = CLIENTS.get(key)
     if client is None:
-        client = ManagedClient(email=email, password=password, otp=otp)
+        client = ManagedClient(email=email, password=password)
         CLIENTS[key] = client
 
     try:
@@ -127,9 +222,90 @@ async def snapshot(request: web.Request) -> web.Response:
     except Exception as err:  # noqa: BLE001 - bridge must return actionable errors
         LOGGER.exception("Snapshot failed for %s", email)
         await client.close()
+        if _needs_reauth(err):
+            return web.json_response(
+                {"error": "XTB session expired. Reauthentication with a fresh OTP is required."},
+                status=428,
+            )
         return web.json_response({"error": str(err)}, status=502)
 
     return web.json_response(data)
+
+
+async def _login_result_response(
+    *,
+    email: str,
+    password: str,
+    cas: CASClient,
+    result: CASLoginSuccess | CASLoginTwoFactorRequired,
+    browser_auth: bool,
+) -> web.Response:
+    if isinstance(result, CASLoginTwoFactorRequired):
+        challenge_id = secrets.token_urlsafe(24)
+        async with PENDING_LOCK:
+            PENDING_LOGINS[challenge_id] = PendingLogin(
+                email=email,
+                password=password,
+                cas=cas,
+                challenge=result,
+                browser_auth=browser_auth,
+                expires_at=min(result.expires_at, time.time() + PENDING_LOGIN_TTL_SECONDS),
+            )
+        return _otp_required_response(challenge_id, result)
+
+    _save_session_file(_session_file(email, password), result.tgt, result.expires_at)
+    try:
+        account_number = await _discover_account_number(email, password)
+        return web.json_response(
+            {
+                "status": "ok",
+                "account_number": account_number,
+            }
+        )
+    finally:
+        await _close_cas(cas)
+
+
+def _otp_required_response(challenge_id: str, challenge: CASLoginTwoFactorRequired) -> web.Response:
+    return web.json_response(
+        {
+            "status": "requires_otp",
+            "challenge_id": challenge_id,
+            "two_factor_auth_type": challenge.two_factor_auth_type,
+            "methods": challenge.methods,
+            "expires_at": datetime.fromtimestamp(challenge.expires_at, UTC).isoformat(),
+        }
+    )
+
+
+async def _login_with_fallback(
+    cas: CASClient,
+    email: str,
+    password: str,
+) -> tuple[CASLoginSuccess | CASLoginTwoFactorRequired, bool]:
+    try:
+        return await cas.login(email, password), False
+    except CASError as err:
+        if "UNAUTHORIZED" in err.code:
+            raise
+        LOGGER.info("REST CAS login failed (%s), trying browser fallback", err.code)
+        return await cas.login_with_browser(email, password), True
+    except Exception as err:
+        LOGGER.info("REST CAS login failed (%s), trying browser fallback", err)
+        return await cas.login_with_browser(email, password), True
+
+
+async def _discover_account_number(email: str, password: str) -> int:
+    managed = CLIENTS.get(_cache_key(email, password))
+    if managed is None:
+        managed = ManagedClient(email=email, password=password)
+        CLIENTS[_cache_key(email, password)] = managed
+
+    await managed.close()
+    managed.account_number = None
+    account_number = await managed._discover_account_number()
+    managed.account_number = account_number
+    return account_number
 
 
 async def _snapshot(client: XTBClient) -> dict[str, Any]:
@@ -375,6 +551,72 @@ def _cache_key(*parts: str) -> str:
     return digest.hexdigest()
 
 
+def _session_file(email: str, password: str) -> Path:
+    return SESSION_DIR / f"{_cache_key(email, password)}.json"
+
+
+def _cookies_file(email: str) -> Path:
+    return SESSION_DIR / f"{_cache_key(email)}_cookies.json"
+
+
+def _new_cas(email: str) -> CASClient:
+    return CASClient(CASClientConfig(cookies_file=_cookies_file(email)))
+
+
+def _save_session_file(path: Path, tgt: str, expires_at: float) -> None:
+    extracted_at = datetime.now(UTC)
+    expires_at_dt = datetime.fromtimestamp(expires_at, tz=UTC)
+    data = {
+        "tgt": tgt,
+        "extracted_at": extracted_at.isoformat(),
+        "expires_at": expires_at_dt.isoformat(),
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    content = json.dumps(data, indent=2)
+    fd = os.open(
+        str(path),
+        os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
+        stat.S_IRUSR | stat.S_IWUSR,
+    )
+    try:
+        os.write(fd, content.encode())
+    finally:
+        os.close(fd)
+
+
+async def _cleanup_pending_logins() -> None:
+    now = time.time()
+    async with PENDING_LOCK:
+        expired = [
+            challenge_id
+            for challenge_id, pending in PENDING_LOGINS.items()
+            if pending.expires_at < now
+        ]
+        pending_to_close = [
+            pending
+            for challenge_id in expired
+            if (pending := PENDING_LOGINS.pop(challenge_id, None)) is not None
+        ]
+    await asyncio.gather(*(_close_cas(pending.cas) for pending in pending_to_close), return_exceptions=True)
+
+
+async def _close_cas(cas: CASClient) -> None:
+    browser_auth = getattr(cas, "_browser_auth", None)
+    if browser_auth is not None:
+        with contextlib.suppress(Exception):
+            await browser_auth.close()
+        cas._browser_auth = None
+    await cas.aclose()
+
+
+def _needs_reauth(err: Exception) -> bool:
+    if isinstance(err, CASError):
+        code = err.code.upper()
+        return "2FA" in code or "TGT_EXPIRED" in code or "NO_SECRET" in code
+    text = str(err).upper()
+    return "2FA" in text or "TWO" in text and "FACTOR" in text or "OTP" in text
+
+
 def _port() -> int:
     options_file = DATA_DIR / "options.json"
     if options_file.exists():
@@ -390,6 +632,8 @@ def main() -> None:
     SESSION_DIR.mkdir(parents=True, exist_ok=True)
     app = web.Application()
     app.router.add_get("/health", health)
+    app.router.add_post("/login/start", login_start)
+    app.router.add_post("/login/complete", login_complete)
     app.router.add_post("/snapshot", snapshot)
     port = _port()
     LOGGER.info("Starting XTB Bridge on 0.0.0.0:%s", port)

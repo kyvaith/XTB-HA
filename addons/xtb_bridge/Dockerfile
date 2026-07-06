@@ -11,7 +11,7 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 RUN pip install --no-cache-dir \
-    "xtb-api-python[totp]==0.10.0" \
+    "xtb-api-python==0.10.0" \
     "aiohttp==3.10.11" \
     && python -m playwright install --with-deps chromium
 

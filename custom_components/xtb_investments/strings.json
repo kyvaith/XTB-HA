@@ -3,13 +3,23 @@
     "step": {
       "user": {
         "title": "XTB Investments",
-        "description": "Connect a read-only Home Assistant integration to XTB xStation5 through an unofficial API client.",
+        "description": "Enter your XTB login and password. If XTB requires a one-time code, the next step will ask for the OTP sent by XTB.",
         "data": {
           "email": "Login",
-          "password": "Password",
-          "otp": "OTP"
+          "password": "Password"
+        }
+      },
+      "otp": {
+        "title": "XTB one-time code",
+        "description": "Enter the OTP code sent by XTB for this login attempt.",
+        "data": {
+          "otp": "OTP code"
         }
       }
+    },
+    "error": {
+      "cannot_connect": "Cannot connect to the XTB Bridge add-on.",
+      "invalid_auth": "XTB rejected the login or OTP code."
     }
   },
   "entity": {

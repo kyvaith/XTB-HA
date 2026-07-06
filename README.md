@@ -25,7 +25,7 @@ This repository starts as a Home Assistant custom integration, not a trading bot
 - The Home Assistant integration has no Chromium dependency.
 - The `addons/xtb_bridge` add-on contains Chromium/Playwright and uses `xtb-api-python==0.10.0`.
 - The add-on auto-detects the XTB account number after login.
-- The integration config is intentionally simple: login, password, OTP.
+- Setup is intentionally simple: login and password first, then a one-time OTP step only if XTB asks for it.
 - Home Assistant polls one normalized account snapshot through a `DataUpdateCoordinator`.
 - Exposes aggregate sensors for equity, balance, free margin, open profit, open position count and pending order count.
 - Stores detailed positions, orders, quotes and account summary as attributes on the portfolio sensor.
@@ -52,7 +52,8 @@ Config fields:
 
 - `email`: XTB login/email
 - `password`: XTB password
-- `otp`: base32 TOTP/OTP secret used to generate one-time codes
+
+If XTB sends an OTP after the password step, Home Assistant shows a second form for that one-time code. The OTP is not stored.
 
 ## Dashboard card
 
@@ -87,4 +88,4 @@ New symbols from later-opened positions still appear in the portfolio sensor att
 
 ## Safety
 
-This integration is read-only by design. It stores credentials in Home Assistant's config entry storage and sends them only to the local bridge add-on. Run it only in a trusted HA instance. Test carefully because XTB's internal API can change without notice.
+This integration is read-only by design. It stores credentials in Home Assistant's config entry storage and sends them only to the local bridge add-on. One-time OTP codes are used only during setup or reauthentication and are not stored. Run it only in a trusted HA instance. Test carefully because XTB's internal API can change without notice.
