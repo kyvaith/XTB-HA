@@ -72,19 +72,20 @@ class XTBInvestmentsCard extends HTMLElement {
       state.state;
     const profit = Number(summary.profit_net ?? summary.position_profit_net ?? 0);
     const profitClass = profit >= 0 ? "positive" : "negative";
+    const profitEntityId = this.profitEntityId(currency);
 
     this.innerHTML = `
       <ha-card>
         <div class="xtb-card">
           <section class="hero">
-            <div class="account-value">
+            <div class="account-value"${this.entityDataAttribute(this.config.entity)}>
               <div class="label">Wartość konta</div>
               <div class="equity">${this.money(accountValue, currency)}</div>
             </div>
             <div class="hero-side">
               <div class="brand">XTB</div>
               <div class="updated">${this.formatDate(attrs.updated_at)}</div>
-              <div class="profit ${profitClass}">
+              <div class="profit ${profitClass}"${this.entityDataAttribute(profitEntityId)}>
                 <ha-icon icon="${profit >= 0 ? "mdi:trending-up" : "mdi:trending-down"}"></ha-icon>
                 <span>${this.money(profit, currency)}</span>
                 <small>${this.percent(summary.profit_percent)}</small>
@@ -100,8 +101,9 @@ class XTBInvestmentsCard extends HTMLElement {
                   ["Symbol", "Dzień", "Zysk/strata"],
                   (position) => {
                     const positionProfit = this.positionProfit(position);
+                    const positionEntityId = this.positionEntityId(position, currency);
                     return `
-                      <tr>
+                      <tr${this.entityDataAttribute(positionEntityId)}>
                         <td class="strong">
                           <div class="instrument">
                             ${this.instrumentMark(position)}
@@ -144,6 +146,7 @@ class XTBInvestmentsCard extends HTMLElement {
       ${this.styles()}
     `;
     this.attachImageFallbacks();
+    this.attachInteractions();
   }
 
   tableSection(title, rows, headers, rowTemplate) {
@@ -173,6 +176,102 @@ class XTBInvestmentsCard extends HTMLElement {
 
   instrumentName(item) {
     return item.display_name || item.name || item.description || item.symbol || "";
+  }
+
+  entityDataAttribute(entityId) {
+    return entityId ? ` data-entity-id="${this.escape(entityId)}"` : "";
+  }
+
+  positionEntityId(position, currency) {
+    const symbol = String(position.symbol || "").toUpperCase();
+    if (!symbol || !this._hass?.states) {
+      return "";
+    }
+
+    const accountNumber = String(position.account_number || "");
+    const orderId = String(position.order_id || "");
+    const expectedProfit = this.positionProfit(position);
+    let best = { entityId: "", score: 0 };
+
+    Object.entries(this._hass.states).forEach(([entityId, state]) => {
+      const attrs = state.attributes || {};
+      if (!entityId.startsWith("sensor.") || String(attrs.symbol || "").toUpperCase() !== symbol) {
+        return;
+      }
+
+      let score = 8;
+      if (accountNumber && String(attrs.account_number || "") === accountNumber) {
+        score += 4;
+      }
+      if (orderId && String(attrs.order_id || "") === orderId) {
+        score += 6;
+      }
+      if (currency && (attrs.unit_of_measurement === currency || attrs.currency === currency)) {
+        score += 3;
+      }
+      if (this.asNumber(attrs.market_value) !== undefined || this.asNumber(attrs.volume) !== undefined) {
+        score += 2;
+      }
+      if (this.asNumber(attrs.profit_loss_percent) !== undefined) {
+        score += 2;
+      }
+      const friendlyName = String(attrs.friendly_name || attrs.name || "").toLowerCase();
+      if (friendlyName.includes("zysk/strata") || friendlyName.includes("profit")) {
+        score += 4;
+      }
+      const stateProfit = this.asNumber(state.state);
+      if (stateProfit !== undefined && Math.abs(stateProfit - expectedProfit) < 0.02) {
+        score += 3;
+      }
+
+      if (score > best.score) {
+        best = { entityId, score };
+      }
+    });
+
+    return best.score >= 10 ? best.entityId : "";
+  }
+
+  profitEntityId(currency) {
+    if (!this._hass?.states) {
+      return "";
+    }
+
+    let best = { entityId: "", score: 0 };
+    Object.entries(this._hass.states).forEach(([entityId, state]) => {
+      const attrs = state.attributes || {};
+      if (!entityId.startsWith("sensor.") || entityId === this.config.entity) {
+        return;
+      }
+
+      let score = 0;
+      if (currency && (attrs.unit_of_measurement === currency || attrs.currency === currency)) {
+        score += 3;
+      }
+      if (this.asNumber(attrs.profit_percent) !== undefined) {
+        score += 4;
+      }
+      if (this.asNumber(attrs.position_profit_net) !== undefined) {
+        score += 2;
+      }
+
+      const friendlyName = String(attrs.friendly_name || "").toLowerCase();
+      if (friendlyName.includes("zysk") || friendlyName.includes("profit")) {
+        score += 3;
+      }
+      if (friendlyName.includes("zysk/strata")) {
+        score -= 6;
+      }
+      if (attrs.symbol) {
+        score -= 6;
+      }
+
+      if (score > best.score) {
+        best = { entityId, score };
+      }
+    });
+
+    return best.score >= 6 ? best.entityId : "";
   }
 
   instrumentMark(item) {
@@ -277,6 +376,40 @@ class XTBInvestmentsCard extends HTMLElement {
         { once: true }
       );
     });
+  }
+
+  attachInteractions() {
+    this.querySelectorAll("[data-entity-id]").forEach((element) => {
+      const entityId = element.dataset.entityId;
+      if (!entityId || !this._hass.states[entityId]) {
+        return;
+      }
+      element.classList.add("clickable");
+      element.setAttribute("role", "button");
+      element.setAttribute("tabindex", "0");
+      element.addEventListener("click", (event) => {
+        event.stopPropagation();
+        this.showMoreInfo(entityId);
+      });
+      element.addEventListener("keydown", (event) => {
+        if (event.key !== "Enter" && event.key !== " ") {
+          return;
+        }
+        event.preventDefault();
+        event.stopPropagation();
+        this.showMoreInfo(entityId);
+      });
+    });
+  }
+
+  showMoreInfo(entityId) {
+    this.dispatchEvent(
+      new CustomEvent("hass-more-info", {
+        bubbles: true,
+        composed: true,
+        detail: { entityId },
+      })
+    );
   }
 
   positionProfit(position) {
@@ -440,6 +573,17 @@ class XTBInvestmentsCard extends HTMLElement {
           white-space: nowrap;
         }
 
+        .account-value.clickable,
+        .profit.clickable {
+          border-radius: 8px;
+          cursor: pointer;
+        }
+
+        .account-value.clickable:hover,
+        .profit.clickable:hover {
+          filter: brightness(1.08);
+        }
+
         .profit ha-icon {
           width: 20px;
           height: 20px;
@@ -498,6 +642,19 @@ class XTBInvestmentsCard extends HTMLElement {
           font-weight: 600;
           text-transform: uppercase;
           letter-spacing: 0;
+        }
+
+        tr.clickable {
+          cursor: pointer;
+        }
+
+        tbody tr.clickable:hover {
+          background: color-mix(in srgb, var(--primary-text-color) 5%, transparent);
+        }
+
+        .clickable:focus-visible {
+          outline: 2px solid var(--primary-color);
+          outline-offset: 3px;
         }
 
         .strong {

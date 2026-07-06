@@ -280,6 +280,7 @@ class XTBPositionProfitSensor(XTBBaseSensor):
         return {
             "name": _position_name(position),
             "symbol": position.get("symbol"),
+            "order_id": position.get("order_id"),
             "account_number": position.get("account_number"),
             "daily_change_percent": position.get("daily_change_percent"),
             "profit_loss_percent": position.get("profit_loss_percent") or position.get("profit_percent"),
