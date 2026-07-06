@@ -534,7 +534,6 @@ class XTBInvestmentsCard extends HTMLElement {
           gap: 18px;
           padding: 0 0 16px;
           align-items: flex-end;
-          border-bottom: 1px solid var(--divider-color);
         }
 
         .account-value {
