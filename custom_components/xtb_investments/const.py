@@ -9,6 +9,7 @@ NAME = "XTB Investments"
 
 PLATFORMS: list[Platform] = [Platform.SENSOR]
 
+CONF_ACCOUNT_NUMBER = "account_number"
 CONF_BRIDGE_URL = "bridge_url"
 CONF_EMAIL = "email"
 CONF_OTP = "otp"

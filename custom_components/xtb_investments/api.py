@@ -48,11 +48,13 @@ class XTBBridgeClient:
         *,
         email: str,
         password: str,
+        account_number: int | None = None,
         bridge_url: str = DEFAULT_BRIDGE_URL,
     ) -> None:
         self._hass = hass
         self._email = email
         self._password = password
+        self._account_number = account_number
         self._bridge_url = bridge_url.rstrip("/")
 
     async def async_close(self) -> None:
@@ -67,6 +69,7 @@ class XTBBridgeClient:
                 json={
                     "email": self._email,
                     "password": self._password,
+                    "account_number": self._account_number,
                 },
                 timeout=ClientTimeout(total=60),
             )

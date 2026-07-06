@@ -15,6 +15,13 @@
         "data": {
           "otp": "Kod OTP"
         }
+      },
+      "account": {
+        "title": "Rachunek XTB",
+        "description": "Wybierz rachunek XTB, który Home Assistant ma śledzić.",
+        "data": {
+          "account_number": "Rachunek"
+        }
       }
     },
     "error": {

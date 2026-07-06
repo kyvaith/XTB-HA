@@ -47,10 +47,16 @@ PENDING_LOCK = asyncio.Lock()
 class ManagedClient:
     """A cached XTB client with automatic account-number discovery."""
 
-    def __init__(self, *, email: str, password: str) -> None:
+    def __init__(
+        self,
+        *,
+        email: str,
+        password: str,
+        account_number: int | None = None,
+    ) -> None:
         self.email = email
         self.password = password
-        self.account_number: int | None = None
+        self.account_number = account_number
         self.client: XTBClient | None = None
         self.lock = asyncio.Lock()
         self.session_file = _session_file(email, password)
@@ -89,9 +95,11 @@ class ManagedClient:
         )
         try:
             await probe.connect()
-            account_number = int(probe.ws.get_account_number())
-            if account_number <= 0:
+            accounts = _accounts_from_client(probe)
+            account = _select_account(accounts, requested_account_number=self.account_number)
+            if account is None:
                 raise RuntimeError("XTB login succeeded but no account number was returned")
+            account_number = int(account["account_number"])
             LOGGER.info("Discovered XTB account number %s for %s", account_number, self.email)
             return account_number
         finally:
@@ -472,14 +480,15 @@ async def snapshot(request: web.Request) -> web.Response:
 
     email = str(payload.get("email") or "").strip()
     password = str(payload.get("password") or "")
+    account_number = _int(payload.get("account_number"))
 
     if not email or not password:
         return web.json_response({"error": "Email and password are required"}, status=400)
 
-    key = _cache_key(email, password)
+    key = _client_key(email, password, account_number)
     client = CLIENTS.get(key)
     if client is None:
-        client = ManagedClient(email=email, password=password)
+        client = ManagedClient(email=email, password=password, account_number=account_number)
         CLIENTS[key] = client
 
     try:
@@ -520,11 +529,16 @@ async def _login_result_response(
 
     _save_session_file(_session_file(email, password), result.tgt, result.expires_at)
     try:
-        account_number = await _discover_account_number(email, password)
+        accounts = await _discover_accounts(email, password)
+        account = _select_account(accounts)
+        if account is None:
+            raise RuntimeError("XTB login succeeded but no account number was returned")
+        account_number = int(account["account_number"])
         return web.json_response(
             {
                 "status": "ok",
                 "account_number": account_number,
+                "accounts": accounts,
             }
         )
     finally:
@@ -569,17 +583,78 @@ async def _login_with_browser(
     return await cas._browser_auth.login(email, password)
 
 
-async def _discover_account_number(email: str, password: str) -> int:
-    managed = CLIENTS.get(_cache_key(email, password))
-    if managed is None:
-        managed = ManagedClient(email=email, password=password)
-        CLIENTS[_cache_key(email, password)] = managed
+async def _discover_accounts(email: str, password: str) -> list[dict[str, Any]]:
+    probe = XTBClient(
+        email=email,
+        password=password,
+        account_number=0,
+        account_type="real",
+        session_file=_session_file(email, password),
+    )
+    try:
+        await probe.connect()
+        accounts = _accounts_from_client(probe)
+        if not accounts:
+            fallback = int(probe.ws.get_account_number())
+            accounts = [
+                {
+                    "account_number": fallback,
+                    "currency": "",
+                    "endpoint_type": "",
+                }
+            ]
+        LOGGER.info("Discovered %d XTB account(s) for %s", len(accounts), email)
+        return accounts
+    finally:
+        await probe.disconnect()
 
-    await managed.close()
-    managed.account_number = None
-    account_number = await managed._discover_account_number()
-    managed.account_number = account_number
-    return account_number
+
+def _accounts_from_client(client: XTBClient) -> list[dict[str, Any]]:
+    login_result = client.ws.account_info
+    if not login_result:
+        return []
+
+    accounts: list[dict[str, Any]] = []
+    for account in login_result.accountList:
+        account_number = _int(getattr(account, "accountNo", None))
+        if account_number is None:
+            continue
+        accounts.append(
+            {
+                "account_number": account_number,
+                "currency": str(getattr(account, "currency", "") or "").upper(),
+                "endpoint_type": str(getattr(account, "endpointType", "") or "").upper(),
+            }
+        )
+    return accounts
+
+
+def _select_account(
+    accounts: list[dict[str, Any]],
+    *,
+    requested_account_number: int | None = None,
+) -> dict[str, Any] | None:
+    if not accounts:
+        return None
+
+    if requested_account_number is not None:
+        for account in accounts:
+            if _int(account.get("account_number")) == requested_account_number:
+                return account
+        raise RuntimeError(f"Requested XTB account {requested_account_number} is not available")
+
+    def score(account: dict[str, Any]) -> tuple[int, int, int]:
+        currency = str(account.get("currency") or "").upper()
+        endpoint_type = str(account.get("endpoint_type") or "").upper()
+        is_demo = "DEMO" in endpoint_type
+        is_real = "REAL" in endpoint_type or not is_demo
+        return (
+            1 if is_real else 0,
+            1 if currency == "PLN" else 0,
+            0 if is_demo else 1,
+        )
+
+    return max(accounts, key=score)
 
 
 async def _snapshot(client: XTBClient) -> dict[str, Any]:
@@ -827,6 +902,10 @@ def _cache_key(*parts: str) -> str:
 
 def _session_file(email: str, password: str) -> Path:
     return SESSION_DIR / f"{_cache_key(email, password)}.json"
+
+
+def _client_key(email: str, password: str, account_number: int | None) -> str:
+    return _cache_key(email, password, str(account_number or "auto"))
 
 
 def _cookies_file(email: str) -> Path:

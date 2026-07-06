@@ -28,6 +28,7 @@ This repository starts as a Home Assistant custom integration, not a trading bot
 - Setup is intentionally simple: login and password first, then a one-time OTP step only if XTB asks for it.
 - Includes brand assets for Home Assistant, HACS and the add-on store.
 - Uses a resilient browser login flow in the bridge for XTB's WAF and OTP screens.
+- Lets Home Assistant track a selected XTB account and defaults to a real PLN account when no account is selected yet.
 - Home Assistant polls one normalized account snapshot through a `DataUpdateCoordinator`.
 - Exposes aggregate sensors for equity, balance, free margin, open profit, open position count and pending order count.
 - Stores detailed positions, orders, quotes and account summary as attributes on the portfolio sensor.
@@ -56,6 +57,8 @@ Config fields:
 - `password`: XTB password
 
 If XTB sends an OTP after the password step, Home Assistant shows a second form for that one-time code. The OTP is not stored.
+
+If XTB returns more than one account, Home Assistant shows an account selection step. Existing entries without a stored account number use the bridge default: prefer a real PLN account when present.
 
 ## Dashboard card
 

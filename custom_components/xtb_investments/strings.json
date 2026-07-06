@@ -15,6 +15,13 @@
         "data": {
           "otp": "OTP code"
         }
+      },
+      "account": {
+        "title": "XTB account",
+        "description": "Choose the XTB account that Home Assistant should track.",
+        "data": {
+          "account_number": "Account"
+        }
       }
     },
     "error": {
