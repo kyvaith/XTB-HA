@@ -52,7 +52,8 @@ class XTBInvestmentsCard extends HTMLElement {
     const orders = Array.isArray(attrs.orders) ? attrs.orders : [];
     const quotes = Object.values(attrs.quotes || {});
     const currency = summary.currency || attrs.unit_of_measurement || "";
-    const profit = Number(summary.open_profit_net || 0);
+    const portfolioValue = summary.portfolio_value ?? summary.account_value ?? state.state;
+    const profit = Number(summary.profit_net ?? summary.position_profit_net ?? 0);
     const profitClass = profit >= 0 ? "positive" : "negative";
 
     this.innerHTML = `
@@ -68,19 +69,19 @@ class XTBInvestmentsCard extends HTMLElement {
 
           <section class="hero">
             <div>
-              <div class="label">Equity</div>
-              <div class="equity">${this.money(summary.equity, currency)}</div>
+              <div class="label">Wartość portfela</div>
+              <div class="equity">${this.money(portfolioValue, currency)}</div>
             </div>
             <div class="profit ${profitClass}">
               <ha-icon icon="${profit >= 0 ? "mdi:trending-up" : "mdi:trending-down"}"></ha-icon>
-              <span>${this.money(summary.open_profit_net, currency)}</span>
-              <small>${this.percent(summary.open_profit_percent)}</small>
+              <span>${this.money(profit, currency)}</span>
+              <small>${this.percent(summary.profit_percent)}</small>
             </div>
           </section>
 
           <section class="metrics">
-            ${this.metric("Saldo", this.money(summary.balance, currency), "mdi:cash")}
-            ${this.metric("Wolny margin", this.money(summary.free_margin, currency), "mdi:cash-check")}
+            ${this.metric("Saldo", this.money(summary.cash_balance ?? summary.balance, currency), "mdi:cash")}
+            ${this.metric("Aktywa", this.money(summary.asset_value, currency), "mdi:briefcase-check")}
             ${this.metric("Pozycje", summary.open_positions ?? positions.length, "mdi:format-list-bulleted")}
             ${this.metric("Zlecenia", summary.pending_orders ?? orders.length, "mdi:clipboard-clock")}
           </section>
@@ -90,18 +91,24 @@ class XTBInvestmentsCard extends HTMLElement {
               ? this.tableSection(
                   "Pozycje",
                   positions,
-                  ["Symbol", "Strona", "Wolumen", "Cena", "P/L"],
-                  (position) => `
-                    <tr>
-                      <td class="strong">${this.escape(position.symbol)}</td>
-                      <td>${this.escape(position.side || "")}</td>
-                      <td>${this.number(position.volume)}</td>
-                      <td>${this.number(position.current_price)}</td>
-                      <td class="${Number(position.profit_net || 0) >= 0 ? "positive" : "negative"}">
-                        ${this.money(position.profit_net, currency)}
-                      </td>
-                    </tr>
-                  `
+                  ["Symbol", "Wolumen", "Wartość", "Dzień", "Zysk/strata"],
+                  (position) => {
+                    const positionProfit = position.profit_loss ?? position.profit_net;
+                    return `
+                      <tr>
+                        <td class="strong">${this.escape(position.symbol)}</td>
+                        <td>${this.number(position.volume)}</td>
+                        <td>${this.money(position.market_value, currency)}</td>
+                        <td class="${Number(position.daily_change_percent || 0) >= 0 ? "positive" : "negative"}">
+                          ${this.percent(position.daily_change_percent)}
+                        </td>
+                        <td class="pl-cell ${Number(positionProfit || 0) >= 0 ? "positive" : "negative"}">
+                          <span>${this.money(positionProfit, currency)}</span>
+                          <small>${this.percent(position.profit_loss_percent ?? position.profit_percent)}</small>
+                        </td>
+                      </tr>
+                    `;
+                  }
                 )
               : ""
           }
@@ -111,7 +118,7 @@ class XTBInvestmentsCard extends HTMLElement {
               ? this.tableSection(
                   "Notowania",
                   quotes,
-                  ["Symbol", "Bid", "Ask", "Spread", "Dzien"],
+                  ["Symbol", "Bid", "Ask", "Spread", "Dzień"],
                   (quote) => `
                     <tr>
                       <td class="strong">${this.escape(quote.symbol)}</td>
@@ -425,6 +432,17 @@ class XTBInvestmentsCard extends HTMLElement {
 
         .strong {
           font-weight: 650;
+        }
+
+        .pl-cell span,
+        .pl-cell small {
+          display: block;
+        }
+
+        .pl-cell small {
+          color: var(--secondary-text-color);
+          font-size: 11px;
+          margin-top: 2px;
         }
 
         .empty {

@@ -27,6 +27,7 @@ from xtb_api import XTBClient
 from xtb_api.auth.browser_auth import BrowserCASAuth, LOGIN_URL, OTP_WAIT_TIMEOUT, _STEALTH_JS
 from xtb_api.auth.cas_client import CASClient, CASClientConfig
 from xtb_api.exceptions import CASError
+from xtb_api.types.enums import SubscriptionEid
 from xtb_api.types.websocket import CASLoginSuccess, CASLoginTwoFactorRequired
 
 DATA_DIR = Path(os.environ.get("XTB_BRIDGE_DATA", "/data"))
@@ -35,6 +36,8 @@ DEBUG_DIR = DATA_DIR / "debug"
 DEFAULT_PORT = 8765
 PENDING_LOGIN_TTL_SECONDS = 300
 BROWSER_LOGIN_TIMEOUT_SECONDS = int(os.environ.get("XTB_BROWSER_LOGIN_TIMEOUT", "90"))
+BALANCE_SNAPSHOT_POLL_MS = 200
+BALANCE_SNAPSHOT_MAX_WAIT_MS = 3000
 
 logging.basicConfig(
     level=os.environ.get("LOG_LEVEL", "INFO"),
@@ -485,17 +488,27 @@ async def snapshot(request: web.Request) -> web.Response:
     if not email or not password:
         return web.json_response({"error": "Email and password are required"}, status=400)
 
-    key = _client_key(email, password, account_number)
-    client = CLIENTS.get(key)
-    if client is None:
-        client = ManagedClient(email=email, password=password, account_number=account_number)
-        CLIENTS[key] = client
-
     try:
-        data = await client.get_snapshot()
+        accounts = await _discover_accounts(email, password)
+        selected_account = _select_account(accounts, requested_account_number=account_number)
+        if selected_account is None:
+            key = _client_key(email, password, account_number)
+            client = CLIENTS.get(key)
+            if client is None:
+                client = ManagedClient(email=email, password=password, account_number=account_number)
+                CLIENTS[key] = client
+            data = await client.get_snapshot()
+        else:
+            tracked_accounts = _tracked_accounts(accounts, selected_account)
+            data = await _snapshot_for_accounts(
+                email=email,
+                password=password,
+                accounts=tracked_accounts,
+                primary_account_number=int(selected_account["account_number"]),
+            )
     except Exception as err:  # noqa: BLE001 - bridge must return actionable errors
         LOGGER.exception("Snapshot failed for %s", email)
-        await client.close()
+        await _close_clients_for(email, password)
         if _needs_reauth(err):
             return web.json_response(
                 {"error": "XTB session expired. Reauthentication with a fresh OTP is required."},
@@ -657,14 +670,151 @@ def _select_account(
     return max(accounts, key=score)
 
 
-async def _snapshot(client: XTBClient) -> dict[str, Any]:
-    balance_raw = await client.get_balance()
-    positions_raw = await client.get_positions()
-    orders_raw = await client.get_orders()
+def _tracked_accounts(
+    accounts: list[dict[str, Any]],
+    selected_account: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Track the selected account plus related real accounts in the same currency."""
+    selected_number = _int(selected_account.get("account_number"))
+    selected_currency = str(selected_account.get("currency") or "").upper()
 
-    account = _normalize_account(balance_raw)
-    positions = [_normalize_position(position) for position in positions_raw]
-    orders = [_normalize_order(order) for order in orders_raw]
+    if not selected_currency or not _is_real_account(selected_account):
+        return [selected_account]
+
+    tracked = [
+        account
+        for account in accounts
+        if _is_real_account(account)
+        and str(account.get("currency") or "").upper() == selected_currency
+    ]
+    if selected_number is not None and not any(
+        _int(account.get("account_number")) == selected_number for account in tracked
+    ):
+        tracked.insert(0, selected_account)
+
+    tracked = sorted(
+        tracked,
+        key=lambda account: (
+            0 if _int(account.get("account_number")) == selected_number else 1,
+            _int(account.get("account_number")) or 0,
+        ),
+    )
+    LOGGER.info(
+        "Tracking XTB account(s): %s",
+        ", ".join(str(account.get("account_number")) for account in tracked),
+    )
+    return tracked or [selected_account]
+
+
+def _is_real_account(account: dict[str, Any]) -> bool:
+    endpoint_type = str(account.get("endpoint_type") or "").upper()
+    return "DEMO" not in endpoint_type and ("REAL" in endpoint_type or not endpoint_type)
+
+
+async def _snapshot_for_accounts(
+    *,
+    email: str,
+    password: str,
+    accounts: list[dict[str, Any]],
+    primary_account_number: int,
+) -> dict[str, Any]:
+    snapshots: list[dict[str, Any]] = []
+    for account in accounts:
+        account_number = _int(account.get("account_number"))
+        if account_number is None:
+            continue
+        key = _client_key(email, password, account_number)
+        client = CLIENTS.get(key)
+        if client is None:
+            client = ManagedClient(email=email, password=password, account_number=account_number)
+            CLIENTS[key] = client
+        snapshots.append(await client.get_snapshot())
+
+    if not snapshots:
+        raise RuntimeError("XTB login succeeded but no account could be tracked")
+    if len(snapshots) == 1:
+        return snapshots[0]
+    return _merge_snapshots(snapshots, primary_account_number)
+
+
+async def _close_clients_for(email: str, password: str) -> None:
+    close_tasks = [
+        client.close()
+        for client in CLIENTS.values()
+        if client.email == email and client.password == password
+    ]
+    if close_tasks:
+        await asyncio.gather(*close_tasks, return_exceptions=True)
+
+
+def _merge_snapshots(
+    snapshots: list[dict[str, Any]],
+    primary_account_number: int,
+) -> dict[str, Any]:
+    primary = next(
+        (
+            snapshot
+            for snapshot in snapshots
+            if _int(snapshot.get("account", {}).get("account_number")) == primary_account_number
+        ),
+        snapshots[0],
+    )
+
+    accounts = [snapshot.get("account", {}) for snapshot in snapshots]
+    positions = [
+        position
+        for snapshot in snapshots
+        for position in snapshot.get("positions", [])
+    ]
+    orders = [
+        order
+        for snapshot in snapshots
+        for order in snapshot.get("orders", [])
+    ]
+    quotes: dict[str, dict[str, Any]] = {}
+    for snapshot in snapshots:
+        quotes.update(snapshot.get("quotes", {}))
+
+    merged_account = {
+        "account_number": primary_account_number,
+        "account_numbers": [
+            account.get("account_number")
+            for account in accounts
+            if account.get("account_number") is not None
+        ],
+        "account_count": len(accounts),
+        "currency": primary.get("account", {}).get("currency") or accounts[0].get("currency") or "",
+        "balance": _sum_values(accounts, "balance"),
+        "cash_balance": _sum_values(accounts, "cash_balance"),
+        "equity": _sum_values(accounts, "equity"),
+        "free_margin": _sum_values(accounts, "free_margin"),
+        "asset_value": _sum_values(accounts, "asset_value"),
+        "portfolio_value": _sum_values(accounts, "portfolio_value"),
+        "profit_net": _sum_values(accounts, "profit_net"),
+        "value_source": "aggregate",
+        "accounts": accounts,
+    }
+
+    return {
+        "account": merged_account,
+        "summary": _build_summary(merged_account, positions, orders, quotes),
+        "positions": positions,
+        "orders": orders,
+        "quotes": quotes,
+        "session": primary.get("session", {}),
+        "updated_at": datetime.now(UTC).isoformat(),
+    }
+
+
+async def _snapshot(client: XTBClient) -> dict[str, Any]:
+    account_meta = _current_account_meta(client)
+    balance_raw = await _fetch_balance_data(client)
+    positions_raw = await _fetch_trade_data(client, SubscriptionEid.POSITIONS, "getPositions")
+    orders_raw = await _fetch_trade_data(client, SubscriptionEid.ORDERS, "getAllOrders")
+
+    account = _normalize_account(balance_raw, account_meta)
+    positions = [_normalize_position(position, account) for position in positions_raw]
+    orders = [_normalize_order(order, account) for order in orders_raw]
 
     symbols = sorted(
         {
@@ -672,15 +822,59 @@ async def _snapshot(client: XTBClient) -> dict[str, Any]:
             *(order["symbol"] for order in orders if order.get("symbol")),
         }
     )
+    symbol_keys: dict[str, str] = {}
+    for item in [*positions, *orders]:
+        symbol = item.get("symbol")
+        symbol_key = item.get("symbol_key")
+        if symbol and symbol_key:
+            symbol_keys[str(symbol)] = str(symbol_key)
 
     quotes: dict[str, dict[str, Any]] = {}
     for symbol in symbols:
         try:
-            quote = await client.get_quote(symbol)
+            quote = await _fetch_quote_data(client, symbol, symbol_keys.get(symbol))
+            if quote is None:
+                quote = await client.get_quote(symbol)
             quotes[symbol] = _normalize_quote(symbol, quote)
         except Exception as err:  # noqa: BLE001
-            LOGGER.debug("Unable to fetch quote for %s: %s", symbol, err)
-            quotes[symbol] = {"symbol": symbol, "available": False, "error": str(err)}
+            LOGGER.debug("Unable to fetch raw quote for %s: %s", symbol, err)
+            try:
+                quotes[symbol] = _normalize_quote(symbol, await client.get_quote(symbol))
+            except Exception as fallback_err:  # noqa: BLE001
+                LOGGER.debug("Unable to fetch fallback quote for %s: %s", symbol, fallback_err)
+                quotes[symbol] = {"symbol": symbol, "available": False, "error": str(fallback_err)}
+
+    for position in positions:
+        quote = quotes.get(position["symbol"], {})
+        if position.get("current_price") in (None, 0) and quote.get("mid") is not None:
+            position["current_price"] = quote.get("mid")
+        if position.get("daily_change_percent") is None:
+            position["daily_change_percent"] = quote.get("daily_change_percent")
+        if position.get("daily_change") is None:
+            position["daily_change"] = quote.get("daily_change")
+        current_price = _float(position.get("current_price"))
+        open_price = _float(position.get("open_price"))
+        volume = _float(position.get("volume"))
+        if position.get("market_value") is None and current_price is not None and volume:
+            position["market_value"] = _rounded(current_price * volume)
+        if position.get("price_change") is None and current_price is not None and open_price:
+            price_change = current_price - open_price
+            position["price_change"] = _rounded(price_change)
+            position["price_change_percent"] = _rounded((price_change / open_price) * 100)
+
+    calculated_asset_value = sum(
+        value
+        for position in positions
+        if (value := _float(position.get("market_value"))) is not None
+    )
+    if account.get("asset_value") is None and calculated_asset_value:
+        account["asset_value"] = _rounded(calculated_asset_value)
+    if account.get("portfolio_value") is None:
+        cash_balance = _float(account.get("cash_balance"))
+        asset_value = _float(account.get("asset_value"))
+        if cash_balance is not None and asset_value is not None:
+            account["portfolio_value"] = _rounded(cash_balance + asset_value)
+            account["value_source"] = "cash_plus_assets"
 
     return {
         "account": account,
@@ -693,62 +887,330 @@ async def _snapshot(client: XTBClient) -> dict[str, Any]:
     }
 
 
-def _normalize_account(raw: Any) -> dict[str, Any]:
-    data = _to_dict(raw)
+async def _fetch_balance_data(client: XTBClient) -> dict[str, Any]:
+    deadline = time.monotonic() + BALANCE_SNAPSHOT_MAX_WAIT_MS / 1000
+    last_balance: dict[str, Any] = {}
+
+    while True:
+        res = await client.ws.send(
+            "getBalance",
+            {"getAndSubscribeElement": {"eid": SubscriptionEid.TOTAL_BALANCE}},
+        )
+        balance = _first_element_payload(client.ws._extract_elements(res), "xtotalbalance")
+        if balance:
+            return balance
+        last_balance = balance
+        if time.monotonic() >= deadline:
+            return last_balance
+        await asyncio.sleep(BALANCE_SNAPSHOT_POLL_MS / 1000)
+
+
+async def _fetch_trade_data(
+    client: XTBClient,
+    eid: SubscriptionEid,
+    command_name: str,
+) -> list[dict[str, Any]]:
+    res = await client.ws.send(
+        command_name,
+        {"getAndSubscribeElement": {"eid": eid}},
+        timeout_ms=30000,
+    )
+    trades: list[dict[str, Any]] = []
+    for element in client.ws._extract_elements(res):
+        trade = (element or {}).get("value", {}).get("xcfdtrade")
+        if isinstance(trade, dict):
+            trades.append(trade)
+    return trades
+
+
+async def _fetch_quote_data(
+    client: XTBClient,
+    symbol: str,
+    symbol_key: str | None,
+) -> dict[str, Any] | None:
+    keys = _quote_candidate_keys(symbol, symbol_key)
+    with contextlib.suppress(Exception):
+        matches = await client.search_instrument(symbol)
+        exact = [
+            match.symbol_key
+            for match in matches
+            if match.symbol.upper() == symbol.upper()
+        ]
+        related = [match.symbol_key for match in matches[:3]]
+        keys = _dedupe_strings([*exact, *keys, *related])
+
+    for key in keys:
+        try:
+            res = await client.ws.subscribe_ticks(key)
+            try:
+                tick = _first_element_payload(client.ws._extract_elements(res), "xcfdtick")
+            finally:
+                with contextlib.suppress(Exception):
+                    await client.ws.unsubscribe_ticks(key)
+            if tick:
+                return tick
+        except Exception:
+            continue
+    return None
+
+
+def _quote_candidate_keys(symbol: str, symbol_key: str | None) -> list[str]:
+    candidates = []
+    if symbol_key:
+        candidates.append(symbol_key)
+    if "_" in symbol:
+        candidates.append(symbol)
+    else:
+        candidates.extend([f"9_{symbol}_6", symbol])
+
+    seen: set[str] = set()
+    result: list[str] = []
+    for candidate in candidates:
+        candidate = str(candidate or "").strip()
+        if candidate and candidate not in seen:
+            seen.add(candidate)
+            result.append(candidate)
+    return result
+
+
+def _dedupe_strings(values: list[str]) -> list[str]:
+    seen: set[str] = set()
+    result: list[str] = []
+    for value in values:
+        value = str(value or "").strip()
+        if value and value not in seen:
+            seen.add(value)
+            result.append(value)
+    return result
+
+
+def _first_element_payload(elements: list[dict[str, Any]], payload_key: str) -> dict[str, Any]:
+    for element in elements:
+        payload = (element or {}).get("value", {}).get(payload_key)
+        if isinstance(payload, dict):
+            return payload
+    return {}
+
+
+def _current_account_meta(client: XTBClient) -> dict[str, Any]:
+    account_number = _int(getattr(client, "account_number", None))
+    currency = ""
+    endpoint_type = ""
+
+    login_result = client.ws.account_info
+    if login_result:
+        for account in login_result.accountList:
+            if account_number is None or _int(getattr(account, "accountNo", None)) == account_number:
+                account_number = _int(getattr(account, "accountNo", None))
+                currency = str(getattr(account, "currency", "") or "").upper()
+                endpoint_type = str(getattr(account, "endpointType", "") or "").upper()
+                break
+
     return {
-        "account_number": _int(data.get("account_number")),
-        "balance": _float(data.get("balance")),
-        "equity": _float(data.get("equity")),
-        "free_margin": _float(data.get("free_margin")),
-        "currency": data.get("currency") or "",
+        "account_number": account_number,
+        "currency": currency,
+        "endpoint_type": endpoint_type,
     }
 
 
-def _normalize_position(raw: Any) -> dict[str, Any]:
+def _normalize_account(raw: Any, meta: dict[str, Any]) -> dict[str, Any]:
+    data = _to_dict(raw)
+    raw_balance = _first_float(data, "balance")
+    cash_balance = _first_float(
+        data,
+        "freeFunds",
+        "free_funds",
+        "cashBalance",
+        "cash_balance",
+        "availableCash",
+        "cash",
+        "balance",
+    )
+    free_margin = _first_float(data, "freeMargin", "free_margin", "freeFunds", "free_funds")
+    equity = _first_float(data, "equity", "netLiquidationValue", "net_liquidation_value")
+    asset_value = _first_float(
+        data,
+        "assetValue",
+        "asset_value",
+        "assetsValue",
+        "securitiesValue",
+        "stockValue",
+        "stocksValue",
+        "marketValue",
+        "portfolioAssetValue",
+    )
+    explicit_value = _first_float(
+        data,
+        "sideBarAccountValue",
+        "side_bar_account_value",
+        "sidebarAccountValue",
+        "accountValue",
+        "account_value",
+        "portfolioValue",
+        "portfolio_value",
+        "totalValue",
+    )
+    largest_value, largest_key = _largest_balance_value(data)
+    portfolio_value = explicit_value
+    value_source = "explicit" if explicit_value is not None else None
+
+    if portfolio_value is None and cash_balance is not None and asset_value is not None:
+        portfolio_value = cash_balance + asset_value
+        value_source = "cash_plus_assets"
+    if portfolio_value is None and largest_value is not None:
+        portfolio_value = largest_value
+        value_source = f"largest_balance_field:{largest_key}"
+    if portfolio_value is None:
+        portfolio_value = equity if equity is not None else raw_balance
+        value_source = "equity_or_balance"
+
+    profit_net = _first_float(
+        data,
+        "totalNetProfit",
+        "totalNetProfitLabel",
+        "total_net_profit",
+        "total_net_profit_label",
+        "sideBarTotalNetProfit",
+        "side_bar_total_net_profit",
+        "netProfit",
+        "net_profit",
+        "profitNet",
+        "profit_net",
+        "profit",
+        "openProfit",
+        "floatingProfit",
+    )
+
+    return {
+        "account_number": _int(data.get("account_number")) or meta.get("account_number"),
+        "balance": _rounded(raw_balance),
+        "cash_balance": _rounded(cash_balance),
+        "equity": _rounded(equity),
+        "free_margin": _rounded(free_margin),
+        "asset_value": _rounded(asset_value),
+        "portfolio_value": _rounded(portfolio_value),
+        "profit_net": _rounded(profit_net),
+        "profit_percent": _rounded(
+            _first_float(
+                data,
+                "totalNetProfitPercent",
+                "totalNetProfitPercentage",
+                "profitPercent",
+                "profit_percentage",
+            )
+        ),
+        "currency": data.get("currency") or meta.get("currency") or "",
+        "endpoint_type": meta.get("endpoint_type") or "",
+        "value_source": value_source,
+        "raw_numeric_balance_fields": _numeric_debug_fields(data),
+    }
+
+
+def _normalize_position(raw: Any, account: dict[str, Any]) -> dict[str, Any]:
     data = _to_dict(raw)
     symbol = str(data.get("symbol") or "").upper()
-    current_price = _float(data.get("current_price")) or 0.0
-    open_price = _float(data.get("open_price")) or 0.0
+    current_price = _first_float(
+        data,
+        "currentPrice",
+        "current_price",
+        "closePrice",
+        "marketPrice",
+        "price",
+    )
+    open_price = _first_float(data, "openPrice", "open_price", "priceOpen") or 0.0
     price_change = current_price - open_price if current_price and open_price else None
     price_change_percent = (
         (price_change / open_price) * 100 if price_change is not None and open_price else None
     )
+    side = _normalize_side(_lookup_value(data, "side"))
+    profit_loss = _first_float(
+        data,
+        "profitNet",
+        "profit_net",
+        "netProfit",
+        "net_profit",
+        "profit",
+        "grossProfit",
+        "profitInAccountCurrency",
+        "profitInCurrency",
+        "pnl",
+        "pl",
+    )
+    profit_loss_percent = _first_float(
+        data,
+        "profitPercent",
+        "profit_percent",
+        "profitPercentage",
+        "rateOfReturn",
+        "returnPercent",
+    )
+    market_value = _first_float(
+        data,
+        "marketValue",
+        "positionValue",
+        "value",
+        "nominalValue",
+        "grossValue",
+    )
+    volume = _first_float(data, "volume", "size", "amount") or 0.0
+    if market_value is None and current_price is not None and volume:
+        market_value = current_price * volume
 
     return {
         "symbol": symbol,
-        "side": data.get("side"),
-        "volume": _float(data.get("volume")) or 0.0,
-        "current_price": current_price,
+        "side": side,
+        "volume": volume,
+        "current_price": _rounded(current_price),
         "open_price": open_price,
         "price_change": _rounded(price_change),
         "price_change_percent": _rounded(price_change_percent),
-        "profit_net": _float(data.get("profit_net")) or 0.0,
-        "profit_percent": _float(data.get("profit_percent")) or 0.0,
-        "stop_loss": _float(data.get("stop_loss")),
-        "take_profit": _float(data.get("take_profit")),
-        "swap": _float(data.get("swap")),
-        "commission": _float(data.get("commission")),
-        "margin": _float(data.get("margin")),
-        "order_id": data.get("order_id"),
-        "instrument_id": _int(data.get("instrument_id")),
-        "open_time": data.get("open_time"),
+        "daily_change": _rounded(_first_float(data, "dailyChange", "dayChange", "change")),
+        "daily_change_percent": _rounded(
+            _first_float(
+                data,
+                "dailyChangePercent",
+                "dayChangePercent",
+                "changePercent",
+                "changePercentage",
+            )
+        ),
+        "profit_loss": _rounded(profit_loss),
+        "profit_loss_percent": _rounded(profit_loss_percent),
+        "profit_net": _rounded(profit_loss),
+        "profit_percent": _rounded(profit_loss_percent),
+        "market_value": _rounded(market_value),
+        "stop_loss": _first_float(data, "sl", "stopLoss", "stop_loss"),
+        "take_profit": _first_float(data, "tp", "takeProfit", "take_profit"),
+        "swap": _first_float(data, "swap"),
+        "commission": _first_float(data, "commission"),
+        "margin": _first_float(data, "margin"),
+        "order_id": _first_str(data, "positionId", "orderId", "order_id", "id"),
+        "instrument_id": _int(_lookup_value(data, "idQuote")) or _int(_lookup_value(data, "instrument_id")),
+        "symbol_key": _first_str(data, "symbolKey", "symbol_key", "key"),
+        "open_time": _lookup_value(data, "openTime") or _lookup_value(data, "open_time"),
+        "account_number": account.get("account_number"),
+        "currency": account.get("currency"),
+        "raw_keys": sorted(data.keys()),
     }
 
 
-def _normalize_order(raw: Any) -> dict[str, Any]:
+def _normalize_order(raw: Any, account: dict[str, Any]) -> dict[str, Any]:
     data = _to_dict(raw)
     return {
         "symbol": str(data.get("symbol") or "").upper(),
-        "side": data.get("side"),
-        "volume": _float(data.get("volume")) or 0.0,
-        "price": _float(data.get("price")) or 0.0,
-        "stop_loss": _float(data.get("stop_loss")),
-        "take_profit": _float(data.get("take_profit")),
-        "order_id": data.get("order_id"),
-        "order_type": data.get("order_type"),
-        "instrument_id": _int(data.get("instrument_id")),
-        "expiration": data.get("expiration"),
-        "open_time": data.get("open_time"),
+        "side": _normalize_side(_lookup_value(data, "side")),
+        "volume": _first_float(data, "volume", "size", "amount") or 0.0,
+        "price": _first_float(data, "openPrice", "open_price", "price") or 0.0,
+        "stop_loss": _first_float(data, "sl", "stopLoss", "stop_loss"),
+        "take_profit": _first_float(data, "tp", "takeProfit", "take_profit"),
+        "order_id": _first_str(data, "positionId", "orderId", "order_id", "id"),
+        "order_type": _first_str(data, "orderType", "order_type", "type"),
+        "instrument_id": _int(_lookup_value(data, "idQuote")) or _int(_lookup_value(data, "instrument_id")),
+        "symbol_key": _first_str(data, "symbolKey", "symbol_key", "key"),
+        "expiration": _lookup_value(data, "expiration"),
+        "open_time": _lookup_value(data, "openTime") or _lookup_value(data, "open_time"),
+        "account_number": account.get("account_number"),
+        "currency": account.get("currency"),
     }
 
 
@@ -757,19 +1219,37 @@ def _normalize_quote(symbol: str, raw: Any) -> dict[str, Any]:
         return {"symbol": symbol.upper(), "available": False}
 
     data = _to_dict(raw)
-    bid = _float(data.get("bid"))
-    ask = _float(data.get("ask"))
+    bid = _first_float(data, "bid")
+    ask = _first_float(data, "ask")
     mid = ((bid + ask) / 2) if bid is not None and ask is not None else None
-    spread = _float(data.get("spread"))
+    spread = _first_float(data, "spread")
     if spread is None and bid is not None and ask is not None:
         spread = ask - bid
 
-    previous = _first_float(data, "previous_close", "prev_close", "close", "open")
-    daily_change = _first_float(data, "daily_change", "change")
+    previous = _first_float(
+        data,
+        "previousClose",
+        "previous_close",
+        "prevClose",
+        "prev_close",
+        "referencePrice",
+        "close",
+        "open",
+    )
+    daily_change = _first_float(data, "dailyChange", "daily_change", "dayChange", "change")
     if daily_change is None and mid is not None and previous:
         daily_change = mid - previous
 
-    daily_change_percent = _first_float(data, "daily_change_percent", "change_percent")
+    daily_change_percent = _first_float(
+        data,
+        "dailyChangePercent",
+        "daily_change_percent",
+        "dayChangePercent",
+        "changePercent",
+        "changePercentage",
+        "percentageChange",
+        "pctChange",
+    )
     if daily_change_percent is None and daily_change is not None and previous:
         daily_change_percent = (daily_change / previous) * 100
 
@@ -781,12 +1261,13 @@ def _normalize_quote(symbol: str, raw: Any) -> dict[str, Any]:
         "mid": _rounded(mid),
         "spread": _rounded(spread),
         "spread_percent": _rounded((spread / mid) * 100 if spread is not None and mid else None),
-        "high": _float(data.get("high")),
-        "low": _float(data.get("low")),
+        "high": _first_float(data, "high"),
+        "low": _first_float(data, "low"),
         "previous": previous,
         "daily_change": _rounded(daily_change),
         "daily_change_percent": _rounded(daily_change_percent),
-        "time": data.get("time"),
+        "time": _lookup_value(data, "timestamp") or _lookup_value(data, "time"),
+        "raw_keys": sorted(data.keys()),
     }
 
 
@@ -812,12 +1293,33 @@ def _build_summary(
     orders: list[dict[str, Any]],
     quotes: dict[str, dict[str, Any]],
 ) -> dict[str, Any]:
-    balance = account.get("balance") or 0.0
-    equity = account.get("equity") or 0.0
-    free_margin = account.get("free_margin") or 0.0
-    used_margin = max(equity - free_margin, 0.0) if equity else 0.0
-    open_profit_net = sum(position.get("profit_net") or 0.0 for position in positions)
-    open_profit_percent = ((equity - balance) / balance) * 100 if balance else None
+    cash_balance = _float(account.get("cash_balance"))
+    balance = cash_balance if cash_balance is not None else _float(account.get("balance"))
+    equity = _float(account.get("equity"))
+    free_margin = _float(account.get("free_margin"))
+    portfolio_value = _float(account.get("portfolio_value"))
+    asset_value = _float(account.get("asset_value"))
+    if portfolio_value is None:
+        portfolio_value = equity if equity is not None else balance
+
+    used_margin = (
+        max(equity - free_margin, 0.0)
+        if equity is not None and free_margin is not None
+        else None
+    )
+    position_profit_net = sum(
+        value
+        for position in positions
+        if (value := _float(position.get("profit_loss"))) is not None
+    )
+    profit_net = _float(account.get("profit_net"))
+    if profit_net is None and positions:
+        profit_net = position_profit_net
+    profit_percent = _float(account.get("profit_percent"))
+    if profit_percent is None and profit_net is not None and portfolio_value:
+        cost_basis = portfolio_value - profit_net
+        profit_percent = (profit_net / cost_basis) * 100 if cost_basis else None
+
     quote_values = [quote for quote in quotes.values() if quote.get("available")]
     daily_changes = [
         quote["daily_change_percent"]
@@ -827,20 +1329,28 @@ def _build_summary(
 
     return {
         "account_number": account.get("account_number"),
+        "account_numbers": account.get("account_numbers") or [account.get("account_number")],
+        "account_count": account.get("account_count") or 1,
         "currency": account.get("currency") or "",
+        "portfolio_value": _rounded(portfolio_value),
+        "account_value": _rounded(portfolio_value),
         "balance": _rounded(balance),
+        "cash_balance": _rounded(balance),
         "equity": _rounded(equity),
         "free_margin": _rounded(free_margin),
+        "asset_value": _rounded(asset_value),
         "used_margin": _rounded(used_margin),
         "margin_level_percent": _rounded((equity / used_margin) * 100 if used_margin else None),
+        "profit_net": _rounded(profit_net),
+        "profit_percent": _rounded(profit_percent),
+        "position_profit_net": _rounded(position_profit_net),
         "open_positions": len(positions),
         "pending_orders": len(orders),
-        "open_profit_net": _rounded(open_profit_net),
-        "open_profit_percent": _rounded(open_profit_percent),
         "quotes_available": len(quote_values),
         "average_daily_change_percent": _rounded(
             sum(daily_changes) / len(daily_changes) if daily_changes else None
         ),
+        "value_source": account.get("value_source"),
     }
 
 
@@ -860,9 +1370,37 @@ def _to_dict(value: Any) -> dict[str, Any]:
     }
 
 
+def _lookup_value(data: dict[str, Any], key: str) -> Any:
+    if key in data:
+        return data[key]
+
+    normalized = _normalize_key(key)
+    for existing_key, value in data.items():
+        if _normalize_key(str(existing_key)) == normalized:
+            return value
+    return None
+
+
+def _normalize_key(key: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", key.lower())
+
+
 def _float(value: Any) -> float | None:
     if value is None or value == "":
         return None
+    if isinstance(value, str):
+        text = value.strip().replace("\xa0", " ")
+        text = re.sub(r"[^0-9,.\-]", "", text)
+        if not text or text in {"-", ".", ","}:
+            return None
+        if "," in text and "." in text:
+            if text.rfind(",") > text.rfind("."):
+                text = text.replace(".", "").replace(",", ".")
+            else:
+                text = text.replace(",", "")
+        elif "," in text:
+            text = text.replace(",", ".")
+        value = text
     try:
         return float(value)
     except (TypeError, ValueError):
@@ -880,10 +1418,78 @@ def _int(value: Any) -> int | None:
 
 def _first_float(data: dict[str, Any], *keys: str) -> float | None:
     for key in keys:
-        value = _float(data.get(key))
+        value = _float(_lookup_value(data, key))
         if value is not None:
             return value
     return None
+
+
+def _first_str(data: dict[str, Any], *keys: str) -> str | None:
+    for key in keys:
+        value = _lookup_value(data, key)
+        if value is not None and value != "":
+            return str(value)
+    return None
+
+
+def _normalize_side(value: Any) -> str | None:
+    if isinstance(value, str) and not value.isdigit():
+        lowered = value.lower()
+        if "buy" in lowered or "kup" in lowered:
+            return "buy"
+        if "sell" in lowered or "sprzed" in lowered:
+            return "sell"
+        return value
+
+    side = _int(value)
+    if side == 0:
+        return "buy"
+    if side == 1:
+        return "sell"
+    return None
+
+
+def _largest_balance_value(data: dict[str, Any]) -> tuple[float | None, str | None]:
+    ignored = (
+        "time",
+        "timestamp",
+        "level",
+        "percent",
+        "percentage",
+        "rate",
+        "id",
+        "account",
+        "number",
+        "leverage",
+    )
+    best_value: float | None = None
+    best_key: str | None = None
+    for key, raw_value in data.items():
+        normalized_key = _normalize_key(str(key))
+        if any(part in normalized_key for part in ignored):
+            continue
+        value = _float(raw_value)
+        if value is None or value <= 0 or value > 1_000_000_000_000:
+            continue
+        if best_value is None or value > best_value:
+            best_value = value
+            best_key = str(key)
+    return best_value, best_key
+
+
+def _numeric_debug_fields(data: dict[str, Any]) -> dict[str, float]:
+    fields: dict[str, float] = {}
+    for key, raw_value in data.items():
+        value = _float(raw_value)
+        if value is not None:
+            fields[str(key)] = _rounded(value) or 0.0
+    return fields
+
+
+def _sum_values(items: list[dict[str, Any]], key: str) -> float | None:
+    values = [_float(item.get(key)) for item in items]
+    numbers = [value for value in values if value is not None]
+    return _rounded(sum(numbers)) if numbers else None
 
 
 def _rounded(value: float | None, precision: int = 4) -> float | None:

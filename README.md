@@ -28,9 +28,9 @@ This repository starts as a Home Assistant custom integration, not a trading bot
 - Setup is intentionally simple: login and password first, then a one-time OTP step only if XTB asks for it.
 - Includes brand assets for Home Assistant, HACS and the add-on store.
 - Uses a resilient browser login flow in the bridge for XTB's WAF and OTP screens.
-- Lets Home Assistant track a selected XTB account and defaults to a real PLN account when no account is selected yet.
-- Home Assistant polls one normalized account snapshot through a `DataUpdateCoordinator`.
-- Exposes aggregate sensors for equity, balance, free margin, open profit, open position count and pending order count.
+- Lets Home Assistant track a selected XTB account and automatically includes related real accounts in the same currency, such as PLN IKZE alongside the main PLN account.
+- Home Assistant polls one normalized investment snapshot through a `DataUpdateCoordinator`.
+- Exposes aggregate sensors for portfolio value, cash balance, free margin, total profit, profit percent, open position count and pending order count.
 - Stores detailed positions, orders, quotes and account summary as attributes on the portfolio sensor.
 - Adds a dashboard card at `custom_components/xtb_investments/frontend/xtb-investments-card.js`.
 - Does not expose buy/sell/cancel services.
@@ -80,13 +80,13 @@ Use the actual portfolio entity ID created by Home Assistant if it differs from 
 
 The integration creates:
 
-- Portfolio sensor with full snapshot attributes
-- Balance sensor
+- Portfolio sensor with full snapshot attributes and the account value shown by XTB
+- Balance sensor for cash/free funds
 - Free margin sensor
-- Open profit sensor
-- Open profit percent sensor
-- Open positions count sensor
-- Pending orders count sensor
+- Profit sensor
+- Profit percent sensor
+- Open positions count sensor, disabled by default as a diagnostic entity
+- Pending orders count sensor, disabled by default as a diagnostic entity
 - Quote sensors for symbols in the initial setup snapshot
 
 New symbols from later-opened positions still appear in the portfolio sensor attributes and card after refresh. Reload the integration if you also want separate quote entities for them.

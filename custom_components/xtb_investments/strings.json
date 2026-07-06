@@ -40,11 +40,11 @@
       "free_margin": {
         "name": "Free margin"
       },
-      "open_profit_net": {
-        "name": "Open profit"
+      "profit": {
+        "name": "Profit"
       },
-      "open_profit_percent": {
-        "name": "Open profit percent"
+      "profit_percent": {
+        "name": "Profit percent"
       },
       "open_positions": {
         "name": "Open positions"

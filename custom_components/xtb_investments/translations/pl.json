@@ -40,11 +40,11 @@
       "free_margin": {
         "name": "Wolny margin"
       },
-      "open_profit_net": {
-        "name": "Wynik otwarty"
+      "profit": {
+        "name": "Zysk"
       },
-      "open_profit_percent": {
-        "name": "Wynik otwarty procent"
+      "profit_percent": {
+        "name": "Zysk procentowy"
       },
       "open_positions": {
         "name": "Otwarte pozycje"

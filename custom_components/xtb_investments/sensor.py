@@ -15,7 +15,7 @@ from homeassistant.components.sensor import (
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import PERCENTAGE
 from homeassistant.core import HomeAssistant
-from homeassistant.helpers.entity import DeviceInfo
+from homeassistant.helpers.entity import DeviceInfo, EntityCategory
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
@@ -43,7 +43,7 @@ SENSORS: tuple[XTBSensorDescription, ...] = (
         device_class=SensorDeviceClass.MONETARY,
         state_class=SensorStateClass.MEASUREMENT,
         currency_unit=True,
-        value_fn=lambda data: data.summary.get("equity"),
+        value_fn=lambda data: data.summary.get("portfolio_value"),
         attrs_fn=lambda data: {
             "account": data.account,
             "summary": data.summary,
@@ -62,7 +62,7 @@ SENSORS: tuple[XTBSensorDescription, ...] = (
         device_class=SensorDeviceClass.MONETARY,
         state_class=SensorStateClass.MEASUREMENT,
         currency_unit=True,
-        value_fn=lambda data: data.summary.get("balance"),
+        value_fn=lambda data: data.summary.get("cash_balance"),
     ),
     XTBSensorDescription(
         key="free_margin",
@@ -74,31 +74,38 @@ SENSORS: tuple[XTBSensorDescription, ...] = (
         value_fn=lambda data: data.summary.get("free_margin"),
     ),
     XTBSensorDescription(
-        key="open_profit_net",
-        translation_key="open_profit_net",
+        key="profit",
+        translation_key="profit",
         icon="mdi:chart-line",
         device_class=SensorDeviceClass.MONETARY,
         state_class=SensorStateClass.MEASUREMENT,
         currency_unit=True,
-        value_fn=lambda data: data.summary.get("open_profit_net"),
+        value_fn=lambda data: data.summary.get("profit_net"),
+        attrs_fn=lambda data: {
+            "profit_percent": data.summary.get("profit_percent"),
+            "position_profit_net": data.summary.get("position_profit_net"),
+            "currency": data.summary.get("currency"),
+        },
     ),
     XTBSensorDescription(
-        key="open_profit_percent",
-        translation_key="open_profit_percent",
+        key="profit_percent",
+        translation_key="profit_percent",
         icon="mdi:percent",
         native_unit_of_measurement=PERCENTAGE,
         state_class=SensorStateClass.MEASUREMENT,
-        value_fn=lambda data: data.summary.get("open_profit_percent"),
+        value_fn=lambda data: data.summary.get("profit_percent"),
     ),
     XTBSensorDescription(
         key="open_positions",
         translation_key="open_positions",
         icon="mdi:format-list-bulleted",
         state_class=SensorStateClass.MEASUREMENT,
+        entity_category=EntityCategory.DIAGNOSTIC,
+        entity_registry_enabled_default=False,
         value_fn=lambda data: data.summary.get("open_positions"),
         attrs_fn=lambda data: {
             "positions": data.positions,
-            "open_profit_net": data.summary.get("open_profit_net"),
+            "position_profit_net": data.summary.get("position_profit_net"),
             "currency": data.summary.get("currency"),
         },
     ),
@@ -107,6 +114,8 @@ SENSORS: tuple[XTBSensorDescription, ...] = (
         translation_key="pending_orders",
         icon="mdi:clipboard-clock",
         state_class=SensorStateClass.MEASUREMENT,
+        entity_category=EntityCategory.DIAGNOSTIC,
+        entity_registry_enabled_default=False,
         value_fn=lambda data: data.summary.get("pending_orders"),
         attrs_fn=lambda data: {"orders": data.orders},
     ),
@@ -161,6 +170,8 @@ class XTBAggregateSensor(XTBBaseSensor):
         super().__init__(coordinator, entry)
         self.entity_description = description
         self._attr_unique_id = f"{entry.entry_id}_{description.key}"
+        self._attr_entity_category = description.entity_category
+        self._attr_entity_registry_enabled_default = description.entity_registry_enabled_default
 
     @property
     def native_value(self) -> StateValue:
