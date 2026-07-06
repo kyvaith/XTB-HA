@@ -533,7 +533,7 @@ class XTBInvestmentsCard extends HTMLElement {
         }
 
         .instrument-avatar.image {
-          background: var(--avatar-bg, #246b8f);
+          background: transparent;
         }
 
         .instrument-avatar img {
@@ -548,6 +548,14 @@ class XTBInvestmentsCard extends HTMLElement {
         }
 
         .instrument-avatar.image-error img {
+          display: none;
+        }
+
+        .instrument-avatar.image-error {
+          background: var(--avatar-bg, #246b8f);
+        }
+
+        .instrument-avatar.image-loaded .instrument-fallback {
           display: none;
         }
 
