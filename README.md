@@ -68,7 +68,7 @@ The integration registers `/xtb_investments/xtb-investments-card.js?v=<version>`
 If your dashboard is in YAML mode or HA blocks automatic resource writes, add this module resource manually:
 
 ```yaml
-url: /xtb_investments/xtb-investments-card.js?v=0.1.10
+url: /xtb_investments/xtb-investments-card.js?v=0.1.11
 type: module
 ```
 
@@ -78,7 +78,6 @@ Example card:
 type: custom:xtb-investments-card
 entity: sensor.xtb_balance
 show_positions: true
-show_quotes: false
 show_orders: false
 ```
 

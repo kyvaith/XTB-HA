@@ -6,7 +6,6 @@ class XTBInvestmentsCard extends HTMLElement {
 
     this.config = {
       show_positions: true,
-      show_quotes: false,
       show_orders: false,
       ...config,
     };
@@ -25,7 +24,6 @@ class XTBInvestmentsCard extends HTMLElement {
     return {
       entity: "sensor.xtb_balance",
       show_positions: true,
-      show_quotes: false,
       show_orders: false,
     };
   }
@@ -49,8 +47,10 @@ class XTBInvestmentsCard extends HTMLElement {
     const attrs = state.attributes || {};
     const summary = attrs.summary || {};
     const positions = Array.isArray(attrs.positions) ? attrs.positions : [];
+    const sortedPositions = [...positions].sort(
+      (a, b) => this.positionProfit(b) - this.positionProfit(a)
+    );
     const orders = Array.isArray(attrs.orders) ? attrs.orders : [];
-    const quotes = Object.values(attrs.quotes || {});
     const currency = summary.currency || attrs.unit_of_measurement || "";
     const totalEquity = this.asNumber(summary.total_equity);
     const profitNet = this.asNumber(summary.profit_net);
@@ -76,74 +76,42 @@ class XTBInvestmentsCard extends HTMLElement {
     this.innerHTML = `
       <ha-card>
         <div class="xtb-card">
-          <div class="xtb-topline">
-            <span>XTB</span>
-            <div class="updated">${this.formatDate(attrs.updated_at)}</div>
-          </div>
-
           <section class="hero">
-            <div>
+            <div class="account-value">
               <div class="label">Wartość konta</div>
               <div class="equity">${this.money(accountValue, currency)}</div>
             </div>
-            <div class="profit ${profitClass}">
-              <ha-icon icon="${profit >= 0 ? "mdi:trending-up" : "mdi:trending-down"}"></ha-icon>
-              <span>${this.money(profit, currency)}</span>
-              <small>${this.percent(summary.profit_percent)}</small>
+            <div class="hero-side">
+              <div class="brand">XTB</div>
+              <div class="updated">${this.formatDate(attrs.updated_at)}</div>
+              <div class="profit ${profitClass}">
+                <ha-icon icon="${profit >= 0 ? "mdi:trending-up" : "mdi:trending-down"}"></ha-icon>
+                <span>${this.money(profit, currency)}</span>
+                <small>${this.percent(summary.profit_percent)}</small>
+              </div>
             </div>
-          </section>
-
-          <section class="metrics">
-            ${this.metric("Wolne", this.money(summary.cash_balance, currency), "mdi:cash")}
-            ${this.metric("Aktywa", this.money(summary.asset_value, currency), "mdi:briefcase-check")}
-            ${this.metric("Pozycje", summary.open_positions ?? positions.length, "mdi:format-list-bulleted")}
-            ${this.metric("Zlecenia", summary.pending_orders ?? orders.length, "mdi:clipboard-clock")}
           </section>
 
           ${
             this.config.show_positions
               ? this.tableSection(
                   "Pozycje",
-                  positions,
-                  ["Symbol", "Wolumen", "Wartość", "Dzień", "Zysk/strata"],
+                  sortedPositions,
+                  ["Symbol", "Dzień", "Zysk/strata"],
                   (position) => {
-                    const positionProfit = position.profit_loss ?? position.profit_net;
+                    const positionProfit = this.positionProfit(position);
                     return `
                       <tr>
                         <td class="strong">${this.escape(this.instrumentName(position))}</td>
-                        <td>${this.number(position.volume)}</td>
-                        <td>${this.money(position.market_value, currency)}</td>
                         <td class="${Number(position.daily_change_percent || 0) >= 0 ? "positive" : "negative"}">
                           ${this.percent(position.daily_change_percent)}
                         </td>
                         <td class="pl-cell ${Number(positionProfit || 0) >= 0 ? "positive" : "negative"}">
                           <span>${this.money(positionProfit, currency)}</span>
-                          <small>${this.percent(position.profit_loss_percent ?? position.profit_percent)}</small>
                         </td>
                       </tr>
                     `;
                   }
-                )
-              : ""
-          }
-
-          ${
-            this.config.show_quotes && quotes.length
-              ? this.tableSection(
-                  "Notowania",
-                  quotes,
-                  ["Symbol", "Bid", "Ask", "Spread", "Dzień"],
-                  (quote) => `
-                    <tr>
-                      <td class="strong">${this.escape(this.instrumentName(quote))}</td>
-                      <td>${this.number(quote.bid)}</td>
-                      <td>${this.number(quote.ask)}</td>
-                      <td>${this.number(quote.spread)}</td>
-                      <td class="${Number(quote.daily_change_percent || 0) >= 0 ? "positive" : "negative"}">
-                        ${this.percent(quote.daily_change_percent)}
-                      </td>
-                    </tr>
-                  `
                 )
               : ""
           }
@@ -169,16 +137,6 @@ class XTBInvestmentsCard extends HTMLElement {
         </div>
       </ha-card>
       ${this.styles()}
-    `;
-  }
-
-  metric(label, value, icon) {
-    return `
-      <div class="metric">
-        <ha-icon icon="${icon}"></ha-icon>
-        <span>${label}</span>
-        <strong>${value}</strong>
-      </div>
     `;
   }
 
@@ -209,6 +167,11 @@ class XTBInvestmentsCard extends HTMLElement {
 
   instrumentName(item) {
     return item.display_name || item.name || item.description || item.symbol || "";
+  }
+
+  positionProfit(position) {
+    const profit = this.asNumber(position.profit_loss ?? position.profit_net);
+    return profit ?? 0;
   }
 
   money(value, currency) {
@@ -294,23 +257,10 @@ class XTBInvestmentsCard extends HTMLElement {
           color: var(--error-color);
         }
 
-        .xtb-topline,
         .hero,
-        .metrics,
-        .profit,
-        .metric {
+        .profit {
           display: flex;
-          align-items: center;
-        }
-
-        .xtb-topline {
-          justify-content: space-between;
-          gap: 16px;
-          margin-bottom: 10px;
-          color: var(--secondary-text-color);
-          font-size: 11px;
-          letter-spacing: 0;
-          text-transform: uppercase;
+          align-items: flex-end;
         }
 
         h3 {
@@ -324,21 +274,43 @@ class XTBInvestmentsCard extends HTMLElement {
           margin-bottom: 8px;
         }
 
-        .updated {
-          color: var(--secondary-text-color);
-          font-size: 12px;
-          white-space: nowrap;
-        }
-
         .hero {
           justify-content: space-between;
           gap: 18px;
-          padding: 8px 0 16px;
+          padding: 0 0 16px;
+          align-items: flex-end;
           border-bottom: 1px solid var(--divider-color);
         }
 
-        .label,
-        .metric span {
+        .account-value {
+          min-width: 0;
+        }
+
+        .hero-side {
+          display: flex;
+          flex-direction: column;
+          align-items: flex-end;
+          gap: 5px;
+          min-width: 150px;
+          text-align: right;
+        }
+
+        .brand {
+          color: var(--secondary-text-color);
+          font-size: 11px;
+          line-height: 1;
+          letter-spacing: 0;
+          text-transform: uppercase;
+        }
+
+        .updated {
+          color: var(--secondary-text-color);
+          font-size: 12px;
+          line-height: 1.2;
+          white-space: nowrap;
+        }
+
+        .label {
           color: var(--secondary-text-color);
           font-size: 12px;
         }
@@ -352,8 +324,8 @@ class XTBInvestmentsCard extends HTMLElement {
 
         .profit {
           justify-content: flex-end;
+          align-items: center;
           gap: 6px;
-          min-width: 138px;
           font-weight: 700;
           white-space: nowrap;
         }
@@ -377,38 +349,6 @@ class XTBInvestmentsCard extends HTMLElement {
           color: #b3261e;
         }
 
-        .metrics {
-          display: grid;
-          grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
-          gap: 8px;
-          margin: 14px 0 18px;
-        }
-
-        .metric {
-          min-width: 0;
-          gap: 8px;
-          padding: 10px;
-          background: color-mix(in srgb, var(--primary-text-color) 5%, transparent);
-          border: 1px solid color-mix(in srgb, var(--divider-color) 65%, transparent);
-          border-radius: 8px;
-        }
-
-        .metric ha-icon {
-          color: #246b8f;
-          width: 18px;
-          height: 18px;
-          flex: 0 0 auto;
-        }
-
-        .metric strong {
-          display: block;
-          margin-left: auto;
-          min-width: 0;
-          overflow-wrap: anywhere;
-          text-align: right;
-          font-size: 13px;
-        }
-
         .table-section {
           margin-top: 16px;
         }
@@ -421,6 +361,12 @@ class XTBInvestmentsCard extends HTMLElement {
           width: 100%;
           border-collapse: collapse;
           font-size: 13px;
+          table-layout: fixed;
+        }
+
+        th:first-child,
+        td:first-child {
+          width: 58%;
         }
 
         th,
@@ -446,17 +392,12 @@ class XTBInvestmentsCard extends HTMLElement {
 
         .strong {
           font-weight: 650;
+          overflow: hidden;
+          text-overflow: ellipsis;
         }
 
-        .pl-cell span,
-        .pl-cell small {
-          display: block;
-        }
-
-        .pl-cell small {
-          color: var(--secondary-text-color);
-          font-size: 11px;
-          margin-top: 2px;
+        .pl-cell span {
+          display: inline-block;
         }
 
         .empty {
@@ -471,20 +412,24 @@ class XTBInvestmentsCard extends HTMLElement {
           }
 
           .hero {
-            align-items: flex-start;
-            flex-direction: column;
+            gap: 12px;
           }
 
-          .profit {
-            justify-content: flex-start;
-          }
-
-          .metrics {
-            grid-template-columns: repeat(2, minmax(0, 1fr));
+          .hero-side {
+            min-width: 116px;
           }
 
           .equity {
             font-size: 25px;
+          }
+
+          table {
+            font-size: 12px;
+          }
+
+          th,
+          td {
+            padding: 8px 4px;
           }
         }
       </style>
@@ -498,5 +443,5 @@ window.customCards = window.customCards || [];
 window.customCards.push({
   type: "xtb-investments-card",
   name: "XTB Investments Card",
-  description: "XTB account balance, positions, orders and daily changes",
+  description: "XTB account balance, profit and sorted positions",
 });
