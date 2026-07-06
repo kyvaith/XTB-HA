@@ -1,6 +1,30 @@
-# XTB Investments for Home Assistant
+<p align="center">
+  <img src="custom_components/xtb_investments/brand/logo.png" alt="XTB Investments" width="180">
+</p>
+
+<h1 align="center">XTB Investments for Home Assistant</h1>
+
+<p align="center">
+  <a href="https://github.com/kyvaith/XTB-HA/releases/latest">
+    <img alt="Latest release" src="https://img.shields.io/github/v/release/kyvaith/XTB-HA?style=for-the-badge">
+  </a>
+  <a href="https://www.home-assistant.io/">
+    <img alt="Home Assistant" src="https://img.shields.io/badge/Home%20Assistant-Custom%20Integration-18BCF2?style=for-the-badge&amp;logo=homeassistant&amp;logoColor=white">
+  </a>
+  <a href="https://hacs.xyz/">
+    <img alt="HACS custom repository" src="https://img.shields.io/badge/HACS-Custom-41BDF5?style=for-the-badge&amp;logo=homeassistantcommunitystore&amp;logoColor=white">
+  </a>
+  <a href="addons/xtb_bridge">
+    <img alt="Home Assistant add-on" src="https://img.shields.io/badge/Home%20Assistant-Add--on-18BCF2?style=for-the-badge&amp;logo=homeassistant&amp;logoColor=white">
+  </a>
+  <img alt="Read only" src="https://img.shields.io/badge/Trading-Read--only-2ea44f?style=for-the-badge">
+</p>
 
 Custom integration, Lovelace card and local bridge add-on for read-only XTB investment statistics in Home Assistant.
+
+<p align="center">
+  <img src="docs/assets/xtb-card.png" alt="XTB Investments Lovelace card" width="520">
+</p>
 
 ## Research summary
 
@@ -33,7 +57,7 @@ This repository starts as a Home Assistant custom integration, not a trading bot
 - Exposes aggregate sensors for account balance, free funds, total profit, profit percent, open position count and pending order count.
 - Stores detailed positions, orders, quotes and account summary as attributes on the balance sensor.
 - Creates instrument-name daily-change sensors and per-position profit/loss sensors.
-- Adds a dashboard card at `custom_components/xtb_investments/frontend/xtb-investments-card.js` and registers it as a Lovelace module resource automatically.
+- Adds a compact dashboard card at `custom_components/xtb_investments/frontend/xtb-investments-card.js` and registers it as a Lovelace module resource automatically.
 - Does not expose buy/sell/cancel services.
 
 ## Why the bridge exists
@@ -64,6 +88,8 @@ If XTB returns more than one account, Home Assistant shows an account selection 
 ## Dashboard card
 
 The integration registers `/xtb_investments/xtb-investments-card.js?v=<version>` as a JavaScript module resource automatically. Refresh the browser after updating the integration so the Home Assistant frontend reloads the card picker.
+
+The card shows the account value, total monetary and percentage profit, the last update time and a compact positions table. Positions are sorted from the largest to the smallest monetary profit/loss. The positions table intentionally shows only instrument name, daily percent change and monetary profit/loss; cash/free-funds metrics and the separate quotes table are omitted to keep the dashboard card dense.
 
 If your dashboard is in YAML mode or HA blocks automatic resource writes, add this module resource manually:
 
