@@ -1069,7 +1069,7 @@ async def _fetch_instrument_info(client: XTBClient, symbol: str) -> dict[str, An
         "name": name,
         "display_name": name,
         "description": description,
-        "icon_url": _instrument_icon_url(data),
+        "icon_url": _instrument_icon_url(data) or _xtb_logo_url(symbol),
         "symbol_key": _first_str(data, "symbol_key", "symbolKey"),
         "instrument_id": _int(_lookup_value(data, "instrument_id")),
         "bid": market_info.get("bid"),
@@ -1336,7 +1336,7 @@ def _normalize_position(raw: Any, account: dict[str, Any]) -> dict[str, Any]:
         "name": _first_str(data, "name", "description", "displayName", "display_name", "instrumentName"),
         "display_name": _first_str(data, "displayName", "display_name", "name", "description", "instrumentName"),
         "description": _first_str(data, "description", "fullDescription", "full_description", "name"),
-        "icon_url": _instrument_icon_url(data),
+        "icon_url": _instrument_icon_url(data) or _xtb_logo_url(symbol),
         "side": side,
         "volume": volume,
         "current_price": _rounded(current_price),
@@ -1392,12 +1392,13 @@ def _normalize_position(raw: Any, account: dict[str, Any]) -> dict[str, Any]:
 
 def _normalize_order(raw: Any, account: dict[str, Any]) -> dict[str, Any]:
     data = _to_dict(raw)
+    symbol = str(data.get("symbol") or "").upper()
     return {
-        "symbol": str(data.get("symbol") or "").upper(),
+        "symbol": symbol,
         "name": _first_str(data, "name", "description", "displayName", "display_name", "instrumentName"),
         "display_name": _first_str(data, "displayName", "display_name", "name", "description", "instrumentName"),
         "description": _first_str(data, "description", "fullDescription", "full_description", "name"),
-        "icon_url": _instrument_icon_url(data),
+        "icon_url": _instrument_icon_url(data) or _xtb_logo_url(symbol),
         "side": _normalize_side(_lookup_value(data, "side")),
         "volume": _first_float(data, "volume", "size", "amount") or 0.0,
         "price": _first_float(data, "openPrice", "open_price", "price") or 0.0,
@@ -1485,12 +1486,14 @@ def _normalize_quote(symbol: str, raw: Any) -> dict[str, Any]:
     if daily_change_percent is None and daily_change is not None and previous:
         daily_change_percent = (daily_change / previous) * 100
 
+    normalized_symbol = str(data.get("symbol") or symbol).upper()
+
     return {
-        "symbol": str(data.get("symbol") or symbol).upper(),
+        "symbol": normalized_symbol,
         "name": _first_str(data, "name", "description", "displayName", "display_name", "instrumentName"),
         "display_name": _first_str(data, "displayName", "display_name", "name", "description", "instrumentName"),
         "description": _first_str(data, "description", "fullDescription", "full_description", "name"),
-        "icon_url": _instrument_icon_url(data),
+        "icon_url": _instrument_icon_url(data) or _xtb_logo_url(normalized_symbol),
         "available": True,
         "bid": bid,
         "ask": ask,
@@ -1713,6 +1716,13 @@ def _instrument_icon_url(data: dict[str, Any]) -> str | None:
     if value.startswith(("https://", "http://", "/", "data:image/")):
         return value
     return None
+
+
+def _xtb_logo_url(symbol: str | None) -> str | None:
+    slug = re.sub(r"[^a-z0-9]+", "_", str(symbol or "").lower()).strip("_")
+    if not slug:
+        return None
+    return f"https://logos.xtb.com/{slug}.png"
 
 
 def _first_present(*values: Any) -> Any:

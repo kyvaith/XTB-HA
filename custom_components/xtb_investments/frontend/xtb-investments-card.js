@@ -143,6 +143,7 @@ class XTBInvestmentsCard extends HTMLElement {
       </ha-card>
       ${this.styles()}
     `;
+    this.attachImageFallbacks();
   }
 
   tableSection(title, rows, headers, rowTemplate) {
@@ -176,18 +177,21 @@ class XTBInvestmentsCard extends HTMLElement {
 
   instrumentMark(item) {
     const iconUrl = this.instrumentIconUrl(item);
+    const key = item.symbol || this.instrumentName(item);
+    const avatarStyle = this.avatarStyle(key);
+    const initials = this.escape(this.instrumentInitials(item));
     if (iconUrl) {
       return `
-        <span class="instrument-avatar image" aria-hidden="true">
+        <span class="instrument-avatar image" style="${avatarStyle}" aria-hidden="true">
+          <span class="instrument-fallback">${initials}</span>
           <img src="${this.escape(iconUrl)}" alt="">
         </span>
       `;
     }
 
-    const key = item.symbol || this.instrumentName(item);
     return `
-      <span class="instrument-avatar" style="${this.avatarStyle(key)}" aria-hidden="true">
-        ${this.escape(this.instrumentInitials(item))}
+      <span class="instrument-avatar" style="${avatarStyle}" aria-hidden="true">
+        <span class="instrument-fallback">${initials}</span>
       </span>
     `;
   }
@@ -209,7 +213,16 @@ class XTBInvestmentsCard extends HTMLElement {
     ) {
       return url;
     }
-    return "";
+    return this.xtbLogoUrl(item.symbol);
+  }
+
+  xtbLogoUrl(symbol) {
+    const slug = String(symbol || "")
+      .trim()
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, "_")
+      .replace(/^_+|_+$/g, "");
+    return slug ? `https://logos.xtb.com/${slug}.png` : "";
   }
 
   instrumentInitials(item) {
@@ -249,6 +262,21 @@ class XTBInvestmentsCard extends HTMLElement {
       hash = (hash * 31 + text.charCodeAt(index)) >>> 0;
     }
     return `--avatar-bg: ${palette[hash % palette.length]}`;
+  }
+
+  attachImageFallbacks() {
+    this.querySelectorAll(".instrument-avatar.image img").forEach((image) => {
+      image.addEventListener(
+        "error",
+        () => image.closest(".instrument-avatar")?.classList.add("image-error"),
+        { once: true }
+      );
+      image.addEventListener(
+        "load",
+        () => image.closest(".instrument-avatar")?.classList.add("image-loaded"),
+        { once: true }
+      );
+    });
   }
 
   positionProfit(position) {
@@ -486,6 +514,7 @@ class XTBInvestmentsCard extends HTMLElement {
         }
 
         .instrument-avatar {
+          position: relative;
           display: inline-flex;
           align-items: center;
           justify-content: center;
@@ -494,7 +523,7 @@ class XTBInvestmentsCard extends HTMLElement {
           height: 24px;
           overflow: hidden;
           border: 1px solid color-mix(in srgb, var(--divider-color) 70%, transparent);
-          border-radius: 6px;
+          border-radius: 8px;
           background: var(--avatar-bg, #246b8f);
           color: #fff;
           font-size: 9px;
@@ -504,14 +533,30 @@ class XTBInvestmentsCard extends HTMLElement {
         }
 
         .instrument-avatar.image {
-          background: color-mix(in srgb, var(--primary-text-color) 8%, transparent);
+          background: var(--avatar-bg, #246b8f);
         }
 
         .instrument-avatar img {
           display: block;
+          position: absolute;
+          inset: 0;
           width: 100%;
           height: 100%;
           object-fit: cover;
+          border-radius: inherit;
+          background: var(--card-background-color, #fff);
+        }
+
+        .instrument-avatar.image-error img {
+          display: none;
+        }
+
+        .instrument-fallback {
+          display: inline-flex;
+          align-items: center;
+          justify-content: center;
+          width: 100%;
+          height: 100%;
         }
 
         .instrument-name {
