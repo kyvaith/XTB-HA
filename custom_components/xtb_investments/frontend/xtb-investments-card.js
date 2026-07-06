@@ -5,6 +5,7 @@ class XTBInvestmentsCard extends HTMLElement {
     }
 
     this.config = {
+      header: "XTB",
       show_positions: true,
       show_orders: false,
       ...config,
@@ -23,9 +24,14 @@ class XTBInvestmentsCard extends HTMLElement {
   static getStubConfig() {
     return {
       entity: "sensor.xtb_balance",
+      header: "XTB",
       show_positions: true,
       show_orders: false,
     };
+  }
+
+  static getConfigElement() {
+    return document.createElement("xtb-investments-card-editor");
   }
 
   render() {
@@ -73,6 +79,7 @@ class XTBInvestmentsCard extends HTMLElement {
     const profit = Number(summary.profit_net ?? summary.position_profit_net ?? 0);
     const profitClass = profit >= 0 ? "positive" : "negative";
     const profitEntityId = this.profitEntityId(currency);
+    const header = this.cardHeader();
 
     this.innerHTML = `
       <ha-card>
@@ -83,7 +90,7 @@ class XTBInvestmentsCard extends HTMLElement {
               <div class="equity">${this.money(accountValue, currency)}</div>
             </div>
             <div class="hero-side">
-              <div class="brand">XTB</div>
+              <div class="brand">${this.escape(header)}</div>
               <div class="updated">${this.formatDate(attrs.updated_at)}</div>
               <div class="profit ${profitClass}"${this.entityDataAttribute(profitEntityId)}>
                 <ha-icon icon="${profit >= 0 ? "mdi:trending-up" : "mdi:trending-down"}"></ha-icon>
@@ -176,6 +183,11 @@ class XTBInvestmentsCard extends HTMLElement {
 
   instrumentName(item) {
     return item.display_name || item.name || item.description || item.symbol || "";
+  }
+
+  cardHeader() {
+    const value = this.config.header ?? this.config.title ?? "XTB";
+    return String(value || "").trim() || "XTB";
   }
 
   entityDataAttribute(entityId) {
@@ -631,6 +643,10 @@ class XTBInvestmentsCard extends HTMLElement {
           white-space: nowrap;
         }
 
+        tbody tr:last-child td {
+          border-bottom: 0;
+        }
+
         th:first-child,
         td:first-child {
           text-align: left;
@@ -771,7 +787,115 @@ class XTBInvestmentsCard extends HTMLElement {
   }
 }
 
-customElements.define("xtb-investments-card", XTBInvestmentsCard);
+class XTBInvestmentsCardEditor extends HTMLElement {
+  setConfig(config) {
+    this.config = {
+      entity: "sensor.xtb_balance",
+      header: "XTB",
+      show_positions: true,
+      show_orders: false,
+      ...config,
+    };
+    this.render();
+  }
+
+  set hass(hass) {
+    this._hass = hass;
+  }
+
+  render() {
+    if (!this.config) {
+      return;
+    }
+
+    this.innerHTML = `
+      <div class="xtb-card-editor">
+        <ha-textfield
+          class="entity-input"
+          label="Encja salda"
+          value="${this.escape(this.config.entity || "")}"
+        ></ha-textfield>
+        <ha-textfield
+          class="header-input"
+          label="Nagłówek"
+          value="${this.escape(this.config.header ?? "XTB")}"
+        ></ha-textfield>
+        <ha-formfield label="Pokaż pozycje">
+          <ha-switch class="positions-input" ${this.config.show_positions !== false ? "checked" : ""}></ha-switch>
+        </ha-formfield>
+        <ha-formfield label="Pokaż zlecenia">
+          <ha-switch class="orders-input" ${this.config.show_orders ? "checked" : ""}></ha-switch>
+        </ha-formfield>
+      </div>
+      ${this.styles()}
+    `;
+
+    this.bindTextInput(".entity-input", "entity");
+    this.bindTextInput(".header-input", "header");
+    this.bindSwitchInput(".positions-input", "show_positions");
+    this.bindSwitchInput(".orders-input", "show_orders");
+  }
+
+  bindTextInput(selector, key) {
+    const input = this.querySelector(selector);
+    input?.addEventListener("input", (event) => {
+      this.updateConfig({ [key]: event.target.value });
+    });
+  }
+
+  bindSwitchInput(selector, key) {
+    const input = this.querySelector(selector);
+    input?.addEventListener("change", (event) => {
+      this.updateConfig({ [key]: event.target.checked });
+    });
+  }
+
+  updateConfig(changedConfig) {
+    this.config = {
+      ...this.config,
+      ...changedConfig,
+    };
+    this.dispatchEvent(
+      new CustomEvent("config-changed", {
+        bubbles: true,
+        composed: true,
+        detail: { config: this.config },
+      })
+    );
+  }
+
+  escape(value) {
+    return String(value ?? "")
+      .replaceAll("&", "&amp;")
+      .replaceAll("<", "&lt;")
+      .replaceAll(">", "&gt;")
+      .replaceAll('"', "&quot;")
+      .replaceAll("'", "&#039;");
+  }
+
+  styles() {
+    return `
+      <style>
+        .xtb-card-editor {
+          display: grid;
+          gap: 12px;
+        }
+
+        ha-textfield {
+          width: 100%;
+        }
+      </style>
+    `;
+  }
+}
+
+if (!customElements.get("xtb-investments-card")) {
+  customElements.define("xtb-investments-card", XTBInvestmentsCard);
+}
+
+if (!customElements.get("xtb-investments-card-editor")) {
+  customElements.define("xtb-investments-card-editor", XTBInvestmentsCardEditor);
+}
 
 window.customCards = window.customCards || [];
 window.customCards.push({

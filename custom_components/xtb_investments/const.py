@@ -6,7 +6,7 @@ from homeassistant.const import Platform
 
 DOMAIN = "xtb_investments"
 NAME = "XTB Investments"
-VERSION = "0.1.15"
+VERSION = "0.1.16"
 
 PLATFORMS: list[Platform] = [Platform.SENSOR]
 

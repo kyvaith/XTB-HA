@@ -89,12 +89,12 @@ If XTB returns more than one account, Home Assistant shows an account selection 
 
 The integration registers `/xtb_investments/xtb-investments-card.js?v=<version>` as a JavaScript module resource automatically. Refresh the browser after updating the integration so the Home Assistant frontend reloads the card picker.
 
-The card shows the account value, total monetary and percentage profit, the last update time and a compact positions table. Positions are sorted from the largest to the smallest monetary profit/loss. Each instrument has a small rounded graphical marker using XTB logo URLs like `https://logos.xtb.com/asb_pl.png`; if a logo is unavailable, the card renders a deterministic ticker avatar. Card elements are clickable: the account value opens the account sensor history, the total profit opens the profit sensor when available, and instrument rows open the matching profit/loss entity history. The positions table intentionally shows only instrument name, daily percent change and monetary profit/loss; cash/free-funds metrics and the separate quotes table are omitted to keep the dashboard card dense.
+The card shows the account value, total monetary and percentage profit, the last update time and a compact positions table. The top-right card header defaults to `XTB` and can be changed in the card editor or with the `header` YAML option. Positions are sorted from the largest to the smallest monetary profit/loss. Each instrument has a small rounded graphical marker using XTB logo URLs like `https://logos.xtb.com/asb_pl.png`; if a logo is unavailable, the card renders a deterministic ticker avatar. Card elements are clickable: the account value opens the account sensor history, the total profit opens the profit sensor when available, and instrument rows open the matching profit/loss entity history. The positions table intentionally shows only instrument name, daily percent change and monetary profit/loss; cash/free-funds metrics and the separate quotes table are omitted to keep the dashboard card dense.
 
 If your dashboard is in YAML mode or HA blocks automatic resource writes, add this module resource manually:
 
 ```yaml
-url: /xtb_investments/xtb-investments-card.js?v=0.1.15
+url: /xtb_investments/xtb-investments-card.js?v=0.1.16
 type: module
 ```
 
@@ -103,6 +103,7 @@ Example card:
 ```yaml
 type: custom:xtb-investments-card
 entity: sensor.xtb_balance
+header: XTB
 show_positions: true
 show_orders: false
 ```
