@@ -90,6 +90,19 @@ SENSORS: tuple[XTBSensorDescription, ...] = (
         value_fn=lambda data: data.summary.get("profit_percent"),
     ),
     XTBSensorDescription(
+        key="deskhub",
+        translation_key="deskhub",
+        icon="mdi:view-dashboard-outline",
+        state_class=SensorStateClass.MEASUREMENT,
+        value_fn=lambda data: data.summary.get("open_positions"),
+        attrs_fn=lambda data: {
+            "summary": _dashboard_summary(data),
+            "rows": _dashboard_rows(data),
+            "currency": data.summary.get("currency"),
+            "updated_at": data.updated_at,
+        },
+    ),
+    XTBSensorDescription(
         key="open_positions",
         translation_key="open_positions",
         icon="mdi:format-list-bulleted",
@@ -412,6 +425,56 @@ def _position_name(position: dict[str, Any]) -> str | None:
         position.get("description"),
         position.get("symbol"),
     )
+
+
+def _dashboard_summary(data: XTBSnapshot) -> str:
+    """Return a compact pipe-delimited summary for small e-paper clients."""
+    return "|".join(
+        (
+            _dashboard_number(_account_value(data)),
+            _dashboard_number(data.summary.get("profit_net")),
+            _dashboard_number(data.summary.get("profit_percent")),
+            str(data.summary.get("currency") or ""),
+        )
+    )
+
+
+def _dashboard_rows(data: XTBSnapshot) -> str:
+    """Return compact rows: name|daily_percent|profit;name|daily_percent|profit."""
+    def profit_value(position: dict[str, Any]) -> float:
+        value = position.get("profit_loss")
+        if value is None:
+            value = position.get("profit_net")
+        return _as_float(value) or 0.0
+
+    rows: list[str] = []
+    for position in sorted(data.positions, key=profit_value, reverse=True)[:10]:
+        profit = position.get("profit_loss")
+        if profit is None:
+            profit = position.get("profit_net")
+        rows.append(
+            "|".join(
+                (
+                    _dashboard_text(_position_name(position) or "Position"),
+                    _dashboard_number(position.get("daily_change_percent")),
+                    _dashboard_number(profit),
+                )
+            )
+        )
+    return ";".join(rows)
+
+
+def _dashboard_number(value: Any) -> str:
+    number = _as_float(value)
+    if number is None:
+        return ""
+    text = f"{number:.2f}"
+    return text.rstrip("0").rstrip(".")
+
+
+def _dashboard_text(value: str, max_length: int = 28) -> str:
+    cleaned = " ".join(str(value).replace("|", " ").replace(";", " ").split())
+    return cleaned[:max_length]
 
 
 def _change_percent_value(data: XTBSnapshot, symbol: str) -> StateValue:

@@ -44,6 +44,9 @@
       "profit_percent": {
         "name": "Zysk procentowy"
       },
+      "deskhub": {
+        "name": "DeskHub"
+      },
       "open_positions": {
         "name": "Otwarte pozycje"
       },

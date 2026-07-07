@@ -55,6 +55,7 @@ This repository starts as a Home Assistant custom integration, not a trading bot
 - Lets Home Assistant track a selected XTB account and automatically includes related real accounts in the same currency, such as PLN IKZE alongside the main PLN account.
 - Home Assistant polls one normalized investment snapshot through a `DataUpdateCoordinator`.
 - Exposes aggregate sensors for account balance, free funds, total profit, profit percent, open position count and pending order count.
+- Exposes a compact DeskHub sensor with small `summary` and `rows` attributes for constrained e-paper dashboards.
 - Stores detailed positions, orders, quotes and account summary as attributes on the balance sensor.
 - Creates instrument-name daily-change sensors and per-position profit/loss sensors.
 - Adds a compact dashboard card at `custom_components/xtb_investments/frontend/xtb-investments-card.js` and registers it as a Lovelace module resource automatically.
@@ -94,7 +95,7 @@ The card shows the account value, total monetary and percentage profit, the last
 If your dashboard is in YAML mode or HA blocks automatic resource writes, add this module resource manually:
 
 ```yaml
-url: /xtb_investments/xtb-investments-card.js?v=0.1.18
+url: /xtb_investments/xtb-investments-card.js?v=0.1.19
 type: module
 ```
 
@@ -118,6 +119,7 @@ The integration creates:
 - Free funds sensor
 - Profit sensor
 - Profit percent sensor
+- DeskHub sensor with compact `summary` and `rows` attributes for ESPHome/e-paper clients
 - Open positions count sensor, disabled by default as a diagnostic entity
 - Pending orders count sensor, disabled by default as a diagnostic entity
 - Daily percent change sensors for instruments in the initial setup snapshot; values are calculated the same way as xStation5, from `xcloseprice.close1day` and the current tick bid. If XTB does not expose close-price data, the entity remains unavailable instead of showing position return.
