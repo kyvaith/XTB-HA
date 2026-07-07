@@ -8,7 +8,7 @@ import voluptuous as vol
 
 from homeassistant import config_entries
 
-from .api import XTBBridgeError, XTBBridgeSetupClient
+from .api import XTBBridgeError, XTBBridgeOTPExpired, XTBBridgeSetupClient
 from .const import (
     CONF_ACCOUNT_NUMBER,
     CONF_BRIDGE_URL,
@@ -32,6 +32,7 @@ class XTBInvestmentsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     _challenge_id: str
     _accounts: list[dict[str, Any]]
     _account_number: int | None = None
+    _bridge_url: str = DEFAULT_BRIDGE_URL
     _reauth: bool = False
 
     async def async_step_user(
@@ -43,13 +44,14 @@ class XTBInvestmentsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
         if user_input is not None:
             self._reauth = False
+            self._bridge_url = DEFAULT_BRIDGE_URL
             self._email = user_input[CONF_EMAIL].strip()
             self._password = user_input[CONF_PASSWORD]
 
             await self.async_set_unique_id(self._email.lower())
             self._abort_if_unique_id_configured()
 
-            setup = XTBBridgeSetupClient(self.hass, bridge_url=DEFAULT_BRIDGE_URL)
+            setup = XTBBridgeSetupClient(self.hass, bridge_url=self._bridge_url)
             try:
                 result = await setup.async_start_login(email=self._email, password=self._password)
             except XTBBridgeError:
@@ -71,12 +73,14 @@ class XTBInvestmentsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         errors: dict[str, str] = {}
 
         if user_input is not None:
-            setup = XTBBridgeSetupClient(self.hass, bridge_url=DEFAULT_BRIDGE_URL)
+            setup = XTBBridgeSetupClient(self.hass, bridge_url=self._bridge_url)
             try:
                 result = await setup.async_complete_login(
                     challenge_id=self._challenge_id,
                     otp=user_input[CONF_OTP],
                 )
+            except XTBBridgeOTPExpired:
+                return await self._restart_expired_otp_challenge()
             except XTBBridgeError:
                 errors["base"] = "invalid_auth"
             else:
@@ -84,7 +88,7 @@ class XTBInvestmentsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
         return self.async_show_form(
             step_id="otp",
-            data_schema=vol.Schema({vol.Required(CONF_OTP): str}),
+            data_schema=_otp_schema(),
             errors=errors,
         )
 
@@ -116,8 +120,9 @@ class XTBInvestmentsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         self._reauth = True
         self._email = entry_data[CONF_EMAIL]
         self._password = entry_data[CONF_PASSWORD]
+        self._bridge_url = entry_data.get(CONF_BRIDGE_URL, DEFAULT_BRIDGE_URL)
 
-        setup = XTBBridgeSetupClient(self.hass, bridge_url=entry_data.get(CONF_BRIDGE_URL, DEFAULT_BRIDGE_URL))
+        setup = XTBBridgeSetupClient(self.hass, bridge_url=self._bridge_url)
         try:
             result = await setup.async_start_login(email=self._email, password=self._password)
         except XTBBridgeError:
@@ -149,7 +154,7 @@ class XTBInvestmentsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                     data_updates={
                         CONF_EMAIL: self._email,
                         CONF_PASSWORD: self._password,
-                        CONF_BRIDGE_URL: DEFAULT_BRIDGE_URL,
+                        CONF_BRIDGE_URL: self._bridge_url,
                         CONF_ACCOUNT_NUMBER: self._get_reauth_entry().data.get(
                             CONF_ACCOUNT_NUMBER,
                             self._account_number,
@@ -170,11 +175,33 @@ class XTBInvestmentsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             data={
                 CONF_EMAIL: self._email,
                 CONF_PASSWORD: self._password,
-                CONF_BRIDGE_URL: DEFAULT_BRIDGE_URL,
+                CONF_BRIDGE_URL: self._bridge_url,
                 CONF_ACCOUNT_NUMBER: self._account_number,
                 CONF_SCAN_INTERVAL: max(DEFAULT_SCAN_INTERVAL, MIN_SCAN_INTERVAL),
             },
         )
+
+    async def _restart_expired_otp_challenge(self) -> config_entries.ConfigFlowResult:
+        """Start a fresh login when the previous OTP challenge expired."""
+        setup = XTBBridgeSetupClient(self.hass, bridge_url=self._bridge_url)
+        try:
+            result = await setup.async_start_login(email=self._email, password=self._password)
+        except XTBBridgeError:
+            return self.async_show_form(
+                step_id="otp",
+                data_schema=_otp_schema(),
+                errors={"base": "cannot_connect"},
+            )
+
+        if result.get("status") == "requires_otp":
+            self._challenge_id = str(result["challenge_id"])
+            return self.async_show_form(
+                step_id="otp",
+                data_schema=_otp_schema(),
+                errors={"base": "otp_expired"},
+            )
+
+        return await self._handle_login_result(result, reauth=self._reauth)
 
 
 def _user_schema() -> vol.Schema:
@@ -184,6 +211,10 @@ def _user_schema() -> vol.Schema:
             vol.Required(CONF_PASSWORD): str,
         }
     )
+
+
+def _otp_schema() -> vol.Schema:
+    return vol.Schema({vol.Required(CONF_OTP): str})
 
 
 def _default_account_number(accounts: list[dict[str, Any]], fallback: Any) -> int | None:

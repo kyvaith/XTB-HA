@@ -26,7 +26,8 @@
     },
     "error": {
       "cannot_connect": "Cannot connect to the XTB Bridge add-on.",
-      "invalid_auth": "XTB rejected the login or OTP code."
+      "invalid_auth": "XTB rejected the login or OTP code.",
+      "otp_expired": "The OTP code expired. A new login attempt was started; enter the new code sent by XTB."
     }
   },
   "entity": {

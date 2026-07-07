@@ -459,7 +459,10 @@ async def login_complete(request: web.Request) -> web.Response:
     async with PENDING_LOCK:
         pending = PENDING_LOGINS.get(challenge_id)
         if pending is None:
-            return web.json_response({"error": "OTP challenge expired. Start login again."}, status=410)
+            return web.json_response(
+                {"error": "OTP challenge expired. Start login again.", "code": "otp_expired"},
+                status=410,
+            )
 
     try:
         if pending.browser_auth:
@@ -473,6 +476,14 @@ async def login_complete(request: web.Request) -> web.Response:
             )
     except Exception as err:  # noqa: BLE001
         LOGGER.warning("OTP completion failed for %s: %s", pending.email, err)
+        if _is_otp_expired_error(err):
+            async with PENDING_LOCK:
+                PENDING_LOGINS.pop(challenge_id, None)
+            await _close_cas(pending.cas)
+            return web.json_response(
+                {"error": "OTP challenge expired. Start login again.", "code": "otp_expired"},
+                status=410,
+            )
         return web.json_response({"error": str(err)}, status=401)
 
     if isinstance(result, CASLoginTwoFactorRequired):
@@ -1874,6 +1885,18 @@ def _needs_reauth(err: Exception) -> bool:
         return "2FA" in code or "TGT_EXPIRED" in code or "NO_SECRET" in code
     text = str(err).upper()
     return "2FA" in text or "TWO" in text and "FACTOR" in text or "OTP" in text
+
+
+def _is_otp_expired_error(err: Exception) -> bool:
+    if isinstance(err, CASError):
+        code = err.code.upper()
+        if "OTP_TIMEOUT" in code or "OTP_EXPIRED" in code:
+            return True
+
+    text = str(err).upper()
+    return "OTP" in text and (
+        "EXPIRED" in text or "TIMEOUT" in text or "TIMED OUT" in text
+    )
 
 
 def _port() -> int:

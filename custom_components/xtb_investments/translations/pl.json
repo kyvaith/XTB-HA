@@ -26,7 +26,8 @@
     },
     "error": {
       "cannot_connect": "Nie można połączyć się z dodatkiem XTB Bridge.",
-      "invalid_auth": "XTB odrzucił login lub kod OTP."
+      "invalid_auth": "XTB odrzucił login lub kod OTP.",
+      "otp_expired": "Kod OTP wygasł. Rozpoczęto nowe logowanie; wpisz nowy kod wysłany przez XTB."
     }
   },
   "entity": {

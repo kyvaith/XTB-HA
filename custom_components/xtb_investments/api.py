@@ -141,7 +141,10 @@ class XTBBridgeSetupClient:
 
             if response.status >= 400:
                 detail = data.get("error") if isinstance(data, dict) else response.reason
-                raise XTBBridgeError(f"XTB bridge returned HTTP {response.status}: {detail}")
+                message = f"XTB bridge returned HTTP {response.status}: {detail}"
+                if _is_otp_expired_response(response.status, detail):
+                    raise XTBBridgeOTPExpired(message)
+                raise XTBBridgeError(message)
         except ClientError as err:
             raise XTBBridgeError(
                 "XTB bridge is not reachable. Install and start the XTB Bridge add-on."
@@ -156,5 +159,21 @@ class XTBBridgeError(RuntimeError):
     """Raised when the bridge cannot return account data."""
 
 
+class XTBBridgeOTPExpired(XTBBridgeError):
+    """Raised when an OTP challenge expired and a new code is required."""
+
+
 class XTBBridgeAuthRequired(XTBBridgeError):
     """Raised when the cached bridge session expired and OTP is required again."""
+
+
+def _is_otp_expired_response(status: int, detail: Any) -> bool:
+    if status == 410:
+        return True
+
+    text = str(detail or "").lower()
+    if "browser_auth_otp_timeout" in text:
+        return True
+    return "otp" in text and (
+        "expired" in text or "timeout" in text or "timed out" in text
+    )
