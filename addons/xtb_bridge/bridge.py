@@ -919,7 +919,7 @@ def _merge_snapshots(
     )
 
     accounts = [snapshot.get("account", {}) for snapshot in snapshots]
-    positions = _aggregate_positions([
+    positions = _deduplicate_positions([
         position
         for snapshot in snapshots
         for position in snapshot.get("positions", [])
@@ -1039,7 +1039,7 @@ async def _snapshot(client: XTBClient) -> dict[str, Any]:
             position["price_change"] = _rounded(price_change)
             position["price_change_percent"] = _rounded((price_change / open_price) * 100)
 
-    positions = _aggregate_positions(positions)
+    positions = _deduplicate_positions(positions)
 
     calculated_asset_value = sum(
         value
@@ -1535,154 +1535,49 @@ def _normalize_position(raw: Any, account: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _aggregate_positions(positions: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Return one dashboard position per instrument, summing lots safely."""
-    groups: dict[str, dict[str, Any]] = {}
-    seen_lots: set[tuple[Any, ...]] = set()
-
+def _deduplicate_positions(positions: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Return one canonical dashboard position per instrument without summing duplicates."""
+    groups: dict[str, list[dict[str, Any]]] = {}
     for index, position in enumerate(positions):
-        lot_key = _position_lot_key(position, index)
-        if lot_key in seen_lots:
-            continue
-        seen_lots.add(lot_key)
+        groups.setdefault(_position_group_key(position, index), []).append(position)
 
-        group_key = _position_group_key(position, index)
-        group = groups.get(group_key)
-        if group is None:
-            group = dict(position)
-            group["_source_count"] = 0
-            group["_order_ids"] = []
-            group["_account_numbers"] = []
-            group["_raw_keys"] = set(position.get("raw_keys") or [])
-            group["_sides"] = set()
-            group["_sum_fields"] = {}
-            group["_open_price_weighted_sum"] = 0.0
-            group["_current_price_weighted_sum"] = 0.0
-            group["_price_weight"] = 0.0
-            groups[group_key] = group
+    deduplicated: list[dict[str, Any]] = []
+    for grouped_positions in groups.values():
+        canonical = dict(max(grouped_positions, key=_position_canonical_score))
+        order_ids: list[Any] = []
+        account_numbers: list[Any] = []
+        raw_keys: set[Any] = set(canonical.get("raw_keys") or [])
+        for position in grouped_positions:
+            _append_unique(order_ids, position.get("order_id"))
+            _append_unique(account_numbers, position.get("account_number"))
+            raw_keys.update(position.get("raw_keys") or [])
 
-        group["_source_count"] += 1
-        _append_unique(group["_order_ids"], position.get("order_id"))
-        _append_unique(group["_account_numbers"], position.get("account_number"))
-        group["_raw_keys"].update(position.get("raw_keys") or [])
-        if position.get("side"):
-            group["_sides"].add(str(position["side"]))
+        duplicate_count = len(grouped_positions)
+        canonical["deduplicated"] = duplicate_count > 1
+        canonical["duplicate_count"] = duplicate_count
+        canonical["position_count"] = duplicate_count
+        canonical["aggregated"] = False
+        canonical["order_ids"] = order_ids
+        canonical["account_numbers"] = account_numbers
+        canonical["raw_keys"] = sorted(raw_keys)
+        deduplicated.append(canonical)
 
-        for key in ("name", "display_name", "description", "icon_url", "symbol_key", "instrument_id"):
-            if group.get(key) in (None, "") and position.get(key) not in (None, ""):
-                group[key] = position[key]
+    return deduplicated
 
-        for key in (
-            "volume",
-            "market_value",
-            "profit_loss",
-            "profit_net",
-            "swap",
-            "commission",
-            "margin",
-        ):
-            value = _float(position.get(key))
-            if value is None:
-                continue
-            sums = group["_sum_fields"]
-            sums[key] = sums.get(key, 0.0) + value
 
-        volume = abs(_float(position.get("volume")) or 0.0)
-        if volume:
-            open_price = _float(position.get("open_price"))
-            current_price = _float(position.get("current_price"))
-            if open_price is not None:
-                group["_open_price_weighted_sum"] += open_price * volume
-                group["_price_weight"] += volume
-            if current_price is not None:
-                group["_current_price_weighted_sum"] += current_price * volume
-
-    aggregated: list[dict[str, Any]] = []
-    for group in groups.values():
-        source_count = int(group.pop("_source_count"))
-        order_ids = group.pop("_order_ids")
-        account_numbers = group.pop("_account_numbers")
-        raw_keys = group.pop("_raw_keys")
-        sides = group.pop("_sides")
-        sum_fields = group.pop("_sum_fields")
-        open_price_weighted_sum = float(group.pop("_open_price_weighted_sum"))
-        current_price_weighted_sum = float(group.pop("_current_price_weighted_sum"))
-        price_weight = float(group.pop("_price_weight"))
-
-        for key, value in sum_fields.items():
-            group[key] = _rounded(value)
-        if group.get("profit_net") is None and group.get("profit_loss") is not None:
-            group["profit_net"] = group["profit_loss"]
-
-        if price_weight:
-            group["open_price"] = _rounded(open_price_weighted_sum / price_weight)
-            if current_price_weighted_sum:
-                group["current_price"] = _rounded(current_price_weighted_sum / price_weight)
-        elif (volume := _float(group.get("volume"))) and group.get("current_price") in (None, 0):
-            market_value = _float(group.get("market_value"))
-            if market_value is not None:
-                group["current_price"] = _rounded(market_value / volume)
-
-        current_price = _float(group.get("current_price"))
-        open_price = _float(group.get("open_price"))
-        if current_price is not None and open_price:
-            price_change = current_price - open_price
-            group["price_change"] = _rounded(price_change)
-            group["price_change_percent"] = _rounded((price_change / open_price) * 100)
-
-        profit_loss = _float(group.get("profit_loss"))
-        market_value = _float(group.get("market_value"))
-        if profit_loss is not None and market_value is not None:
-            cost_basis = market_value - profit_loss
-            if cost_basis:
-                group["profit_loss_percent"] = _rounded((profit_loss / cost_basis) * 100)
-                group["profit_percent"] = group["profit_loss_percent"]
-
-        group["side"] = next(iter(sides)) if len(sides) == 1 else ("mixed" if sides else group.get("side"))
-        group["aggregated"] = source_count > 1
-        group["position_count"] = source_count
-        group["order_ids"] = order_ids
-        group["order_id"] = order_ids[0] if len(order_ids) == 1 else None
-        group["account_numbers"] = account_numbers
-        group["account_number"] = account_numbers[0] if len(account_numbers) == 1 else None
-        group["raw_keys"] = sorted(raw_keys)
-        aggregated.append(group)
-
-    return aggregated
+def _position_canonical_score(position: dict[str, Any]) -> tuple[float, float, float]:
+    market_value = abs(_float(position.get("market_value")) or 0.0)
+    profit = abs(_float(position.get("profit_loss")) or _float(position.get("profit_net")) or 0.0)
+    volume = abs(_float(position.get("volume")) or 0.0)
+    return (market_value, profit, volume)
 
 
 def _position_group_key(position: dict[str, Any], index: int) -> str:
     symbol = str(position.get("symbol") or "").upper()
-    if symbol:
-        return symbol
-    return f"position-{index}"
-
-
-def _position_lot_key(position: dict[str, Any], index: int) -> tuple[Any, ...]:
     account_number = position.get("account_number")
-    order_id = position.get("order_id")
-    symbol = str(position.get("symbol") or "").upper()
-    if order_id:
-        return (
-            "order",
-            account_number,
-            symbol,
-            str(order_id),
-            position.get("open_time"),
-            position.get("volume"),
-            position.get("market_value"),
-            position.get("profit_loss"),
-        )
-    return (
-        "position",
-        account_number,
-        symbol,
-        position.get("open_time"),
-        position.get("open_price"),
-        position.get("volume"),
-        position.get("market_value"),
-        position.get("profit_loss"),
-    )
+    if symbol:
+        return f"{account_number or 'account'}:{symbol}"
+    return f"position-{index}"
 
 
 def _append_unique(values: list[Any], value: Any) -> None:

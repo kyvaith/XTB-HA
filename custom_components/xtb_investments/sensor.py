@@ -299,6 +299,8 @@ class XTBPositionProfitSensor(XTBBaseSensor):
             "account_numbers": position.get("account_numbers"),
             "position_count": position.get("position_count"),
             "aggregated": position.get("aggregated"),
+            "deduplicated": position.get("deduplicated"),
+            "duplicate_count": position.get("duplicate_count"),
             "daily_change_percent": position.get("daily_change_percent"),
             "profit_loss_percent": position.get("profit_loss_percent") or position.get("profit_percent"),
             "market_value": position.get("market_value"),
