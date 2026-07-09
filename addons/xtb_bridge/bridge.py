@@ -35,7 +35,15 @@ SESSION_DIR = DATA_DIR / "sessions"
 DEBUG_DIR = DATA_DIR / "debug"
 DEFAULT_PORT = 8765
 PENDING_LOGIN_TTL_SECONDS = 300
+TGT_REFRESH_MARGIN_SECONDS = 5 * 60
 BROWSER_LOGIN_TIMEOUT_SECONDS = int(os.environ.get("XTB_BROWSER_LOGIN_TIMEOUT", "90"))
+BROWSER_USER_AGENT = os.environ.get(
+    "XTB_BROWSER_USER_AGENT",
+    (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36"
+    ),
+)
 BALANCE_SNAPSHOT_POLL_MS = 200
 BALANCE_SNAPSHOT_MAX_WAIT_MS = 3000
 CLOSE_PRICE_EID = 1005
@@ -92,6 +100,7 @@ class ManagedClient:
         if self.account_number is None:
             self.account_number = await self._discover_account_number()
 
+        await _ensure_session_ready(self.email, self.password)
         self.client = XTBClient(
             email=self.email,
             password=self.password,
@@ -104,6 +113,7 @@ class ManagedClient:
 
     async def _discover_account_number(self) -> int:
         LOGGER.info("Discovering XTB account number for %s", self.email)
+        await _ensure_session_ready(self.email, self.password)
         probe = XTBClient(
             email=self.email,
             password=self.password,
@@ -151,9 +161,26 @@ class PendingLogin:
 class ResilientBrowserCASAuth(BrowserCASAuth):
     """Browser login flow with UI-based OTP detection and better diagnostics."""
 
+    def __init__(
+        self,
+        *,
+        headless: bool = True,
+        profile_dir: Path | None = None,
+        cookies_file: Path | None = None,
+        user_agent: str = BROWSER_USER_AGENT,
+        device_fingerprint: str | None = None,
+    ) -> None:
+        super().__init__(headless=headless)
+        self._context = None
+        self._profile_dir = profile_dir
+        self._cookies_file = cookies_file
+        self._user_agent = user_agent
+        self._device_fingerprint = device_fingerprint or _device_fingerprint("default")
+
     async def login(self, email: str, password: str) -> CASLoginSuccess | CASLoginTwoFactorRequired:
         try:
             from playwright.async_api import Error as PlaywrightError
+            from playwright.async_api import TimeoutError as PlaywrightTimeoutError
             from playwright.async_api import async_playwright
         except ImportError as err:
             raise CASError(
@@ -164,46 +191,73 @@ class ResilientBrowserCASAuth(BrowserCASAuth):
         needs_cleanup = True
         self._playwright = await async_playwright().start()
         try:
+            profile_dir = self._profile_dir or _browser_profile_dir(email)
+            _ensure_private_dir(profile_dir)
             try:
-                self._browser = await self._playwright.chromium.launch(
+                context = await self._playwright.chromium.launch_persistent_context(
+                    user_data_dir=str(profile_dir),
                     headless=self._headless,
                     args=[
                         "--disable-blink-features=AutomationControlled",
                         "--disable-dev-shm-usage",
                         "--no-sandbox",
                     ],
+                    user_agent=self._user_agent,
+                    locale="pl-PL",
+                    timezone_id="Europe/Warsaw",
+                    viewport={"width": 1366, "height": 768},
+                    screen={"width": 1366, "height": 768},
                 )
-            except PlaywrightError as err:
+            except (PlaywrightError, PlaywrightTimeoutError) as err:
                 raise CASError("BROWSER_CHROMIUM_FAILED", str(err)) from err
 
-            context = await self._browser.new_context(
-                user_agent=(
-                    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                    "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
-                ),
-                locale="pl-PL",
-                timezone_id="Europe/Warsaw",
-            )
+            self._context = context
             await context.add_init_script(_STEALTH_JS)
+            await context.add_init_script(
+                f"""
+                try {{
+                    const fingerprint = {json.dumps(self._device_fingerprint)};
+                    if (!localStorage.getItem('deviceFingerprint')) {{
+                        localStorage.setItem('deviceFingerprint', fingerprint);
+                    }}
+                    if (!localStorage.getItem('fingerprint')) {{
+                        localStorage.setItem('fingerprint', fingerprint);
+                    }}
+                    Object.defineProperty(navigator, 'platform', {{ get: () => 'Win32' }});
+                }} catch(e) {{}}
+                """
+            )
+            for page in context.pages:
+                with contextlib.suppress(Exception):
+                    await page.close()
 
             self._page = await context.new_page()
             self._page.on("response", self._on_response)
 
-            fingerprint = hashlib.sha256(b"xStation5/2.94.1 (Linux x86_64)").hexdigest().upper()
-            await context.add_init_script(
-                f"""
-                try {{
-                    localStorage.setItem('deviceFingerprint', '{fingerprint}');
-                    localStorage.setItem('fingerprint', '{fingerprint}');
-                }} catch(e) {{}}
-                """
-            )
-
-            LOGGER.info("Navigating browser to %s", LOGIN_URL)
+            LOGGER.info("Navigating trusted browser profile %s to %s", profile_dir, LOGIN_URL)
             await self._page.goto(LOGIN_URL, wait_until="commit", timeout=30_000)
 
             email_input = self._page.get_by_role("textbox").first
-            await email_input.wait_for(state="visible", timeout=30_000)
+            try:
+                await email_input.wait_for(state="visible", timeout=30_000)
+            except PlaywrightError as err:
+                if self._tgt:
+                    await self._persist_trusted_state()
+                    await self.close()
+                    return CASLoginSuccess(tgt=self._tgt, expires_at=time.time() + 8 * 3600)
+                if self._two_factor_detected.is_set():
+                    needs_cleanup = False
+                    info = self._two_factor_info or {}
+                    login_ticket = self._login_ticket or "browser-2fa"
+                    return CASLoginTwoFactorRequired(
+                        login_ticket=login_ticket,
+                        session_id=login_ticket,
+                        two_factor_auth_type=info.get("twoFactorAuthType", "SMS"),
+                        methods=[info.get("twoFactorAuthType", "SMS")],
+                        expires_at=time.time() + OTP_WAIT_TIMEOUT,
+                    )
+                await self._save_debug_artifacts("login-form-timeout")
+                raise CASError("BROWSER_AUTH_NO_LOGIN_FORM", "Browser login form was not visible") from err
             LOGGER.info("Browser login form found")
 
             await email_input.click()
@@ -233,6 +287,7 @@ class ResilientBrowserCASAuth(BrowserCASAuth):
                 task.cancel()
 
             if self._tgt:
+                await self._persist_trusted_state()
                 await self.close()
                 return CASLoginSuccess(tgt=self._tgt, expires_at=time.time() + 8 * 3600)
 
@@ -287,6 +342,7 @@ class ResilientBrowserCASAuth(BrowserCASAuth):
 
             if not self._tgt:
                 raise CASError("BROWSER_AUTH_NO_TGT", "OTP submitted but no TGT received")
+            await self._persist_trusted_state()
             return CASLoginSuccess(tgt=self._tgt, expires_at=time.time() + 8 * 3600)
         finally:
             await self.close()
@@ -408,6 +464,64 @@ class ResilientBrowserCASAuth(BrowserCASAuth):
         with contextlib.suppress(Exception):
             base.with_suffix(".html").write_text(await self._page.content(), encoding="utf-8")
 
+    async def _persist_trusted_state(self) -> None:
+        if self._page:
+            with contextlib.suppress(Exception):
+                await self._page.wait_for_timeout(1000)
+        await self._persist_cas_cookies()
+
+    async def _persist_cas_cookies(self) -> None:
+        if not self._context or not self._cookies_file:
+            return
+
+        with contextlib.suppress(Exception):
+            cookies = await self._context.cookies()
+            values = {
+                cookie["name"]: cookie["value"]
+                for cookie in cookies
+                if cookie.get("name") and cookie.get("value") and "xtb.com" in cookie.get("domain", "")
+            }
+            if not values:
+                return
+
+            existing: dict[str, str] = {}
+            if self._cookies_file.exists():
+                with contextlib.suppress(json.JSONDecodeError, OSError):
+                    loaded = json.loads(self._cookies_file.read_text())
+                    if isinstance(loaded, dict):
+                        existing = {
+                            str(key): str(value)
+                            for key, value in loaded.items()
+                            if isinstance(key, str) and isinstance(value, str)
+                        }
+            existing.update(values)
+            self._cookies_file.parent.mkdir(parents=True, exist_ok=True)
+            content = json.dumps(existing, indent=2)
+            fd = os.open(
+                str(self._cookies_file),
+                os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
+                stat.S_IRUSR | stat.S_IWUSR,
+            )
+            try:
+                os.write(fd, content.encode())
+            finally:
+                os.close(fd)
+
+    async def close(self) -> None:
+        with contextlib.suppress(Exception):
+            if self._context:
+                await self._context.close()
+        with contextlib.suppress(Exception):
+            if self._browser:
+                await self._browser.close()
+        with contextlib.suppress(Exception):
+            if self._playwright:
+                await self._playwright.stop()
+        self._context = None
+        self._browser = None
+        self._page = None
+        self._playwright = None
+
 
 async def health(_request: web.Request) -> web.Response:
     return web.json_response({"ok": True})
@@ -426,9 +540,14 @@ async def login_start(request: web.Request) -> web.Response:
         return web.json_response({"error": "Email and password are required"}, status=400)
 
     await _cleanup_pending_logins()
-    cas = _new_cas(email)
+    cas = _new_cas(email, password)
     try:
-        result, browser_auth = await _login_with_fallback(cas, email, password)
+        result, browser_auth = await _login_with_fallback(
+            cas,
+            email,
+            password,
+            prefer_browser_on_2fa=True,
+        )
     except Exception as err:  # noqa: BLE001
         LOGGER.exception("Login start failed for %s", email)
         await _close_cas(cas)
@@ -600,9 +719,15 @@ async def _login_with_fallback(
     cas: CASClient,
     email: str,
     password: str,
+    *,
+    prefer_browser_on_2fa: bool = False,
 ) -> tuple[CASLoginSuccess | CASLoginTwoFactorRequired, bool]:
     try:
-        return await cas.login(email, password), False
+        result = await cas.login(email, password)
+        if prefer_browser_on_2fa and isinstance(result, CASLoginTwoFactorRequired):
+            LOGGER.info("REST CAS login requires 2FA; trying trusted browser profile before prompting")
+            return await _login_with_browser(cas, email, password), True
+        return result, False
     except CASError as err:
         if "UNAUTHORIZED" in err.code:
             raise
@@ -618,11 +743,18 @@ async def _login_with_browser(
     email: str,
     password: str,
 ) -> CASLoginSuccess | CASLoginTwoFactorRequired:
-    cas._browser_auth = ResilientBrowserCASAuth(headless=True)
+    cas._browser_auth = ResilientBrowserCASAuth(
+        headless=True,
+        profile_dir=_browser_profile_dir(email),
+        cookies_file=_cookies_file(email, password),
+        user_agent=BROWSER_USER_AGENT,
+        device_fingerprint=_device_fingerprint(email),
+    )
     return await cas._browser_auth.login(email, password)
 
 
 async def _discover_accounts(email: str, password: str) -> list[dict[str, Any]]:
+    await _ensure_session_ready(email, password)
     probe = XTBClient(
         email=email,
         password=password,
@@ -1821,16 +1953,74 @@ def _session_file(email: str, password: str) -> Path:
     return SESSION_DIR / f"{_cache_key(email, password)}.json"
 
 
+def _session_file_is_fresh(path: Path) -> bool:
+    if not path.exists():
+        return False
+
+    try:
+        data = json.loads(path.read_text())
+        tgt = str(data.get("tgt") or "")
+        expires_at = datetime.fromisoformat(str(data.get("expires_at") or "")).timestamp()
+    except (AttributeError, json.JSONDecodeError, OSError, ValueError):
+        return False
+
+    return bool(tgt) and time.time() < (expires_at - TGT_REFRESH_MARGIN_SECONDS)
+
+
+async def _ensure_session_ready(email: str, password: str) -> None:
+    session_file = _session_file(email, password)
+    if _session_file_is_fresh(session_file):
+        return
+
+    LOGGER.info("Cached XTB TGT is missing or expired for %s; refreshing before API connect", email)
+    cas = _new_cas(email, password)
+    try:
+        result, browser_auth = await _login_with_fallback(
+            cas,
+            email,
+            password,
+            prefer_browser_on_2fa=True,
+        )
+        if isinstance(result, CASLoginTwoFactorRequired):
+            raise CASError(
+                "AUTH_MANAGER_2FA_NO_SECRET",
+                "2FA is required and the trusted browser profile did not bypass OTP",
+            )
+
+        _save_session_file(session_file, result.tgt, result.expires_at)
+        LOGGER.info(
+            "Refreshed XTB TGT for %s using %s",
+            email,
+            "trusted browser profile" if browser_auth else "REST CAS",
+        )
+    finally:
+        await _close_cas(cas)
+
+
 def _client_key(email: str, password: str, account_number: int | None) -> str:
     return _cache_key(email, password, str(account_number or "auto"))
 
 
-def _cookies_file(email: str) -> Path:
-    return SESSION_DIR / f"{_cache_key(email)}_cookies.json"
+def _cookies_file(email: str, password: str) -> Path:
+    return SESSION_DIR / f"{_cache_key(email, password)}_cookies.json"
 
 
-def _new_cas(email: str) -> CASClient:
-    return CASClient(CASClientConfig(cookies_file=_cookies_file(email)))
+def _browser_profile_dir(email: str) -> Path:
+    return SESSION_DIR / "browser_profiles" / _cache_key(email)
+
+
+def _device_fingerprint(email: str) -> str:
+    return hashlib.sha256(f"{email.lower()}|{BROWSER_USER_AGENT}".encode()).hexdigest().upper()
+
+
+def _ensure_private_dir(path: Path) -> None:
+    path.mkdir(parents=True, exist_ok=True)
+    with contextlib.suppress(OSError):
+        path.chmod(stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR)
+
+
+def _new_cas(email: str, password: str) -> CASClient:
+    return CASClient(CASClientConfig(cookies_file=_cookies_file(email, password)))
 
 
 def _save_session_file(path: Path, tgt: str, expires_at: float) -> None:
