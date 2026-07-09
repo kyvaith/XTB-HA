@@ -95,7 +95,7 @@ The card shows the account value, total monetary and percentage profit, the last
 If your dashboard is in YAML mode or HA blocks automatic resource writes, add this module resource manually:
 
 ```yaml
-url: /xtb_investments/xtb-investments-card.js?v=0.1.23
+url: /xtb_investments/xtb-investments-card.js?v=0.1.24
 type: module
 ```
 

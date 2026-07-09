@@ -18,8 +18,11 @@ from pathlib import Path
 import re
 import secrets
 import stat
+import struct
 import time
 from typing import Any
+from urllib import error as urllib_error
+from urllib import request as urllib_request
 
 from aiohttp import web
 
@@ -47,6 +50,12 @@ BROWSER_USER_AGENT = os.environ.get(
 BALANCE_SNAPSHOT_POLL_MS = 200
 BALANCE_SNAPSHOT_MAX_WAIT_MS = 3000
 CLOSE_PRICE_EID = 1005
+XTB_IPAX_API_URL = os.environ.get("XTB_IPAX_API_URL", "https://ipax.xtb.com").rstrip("/")
+GRPC_WEB_TIMEOUT_SECONDS = float(os.environ.get("XTB_GRPC_WEB_TIMEOUT", "20"))
+RETIRE_ACCOUNT_TYPE_IKE = 1
+RETIRE_ACCOUNT_TYPE_IKZE = 2
+RETIRE_ACCOUNT_TYPE_PEA = 4
+RETIRE_ACCOUNT_STATUS_ON_REAL_CAN_ACCESS = 1
 CLOSE_PRICE_FIELDS = (
     "close1day",
     "close1dayTime",
@@ -108,6 +117,7 @@ class ManagedClient:
             account_type="real",
             session_file=self.session_file,
         )
+        self.client._xtb_bridge_session_file = self.session_file
         await self.client.connect()
         return self.client
 
@@ -866,7 +876,7 @@ def _tracked_accounts(
 
 def _is_real_account(account: dict[str, Any]) -> bool:
     endpoint_type = str(account.get("endpoint_type") or "").upper()
-    return "DEMO" not in endpoint_type and ("REAL" in endpoint_type or not endpoint_type)
+    return "DEMO" not in endpoint_type
 
 
 async def _snapshot_for_accounts(
@@ -932,6 +942,11 @@ def _merge_snapshots(
     quotes: dict[str, dict[str, Any]] = {}
     for snapshot in snapshots:
         quotes.update(snapshot.get("quotes", {}))
+    retirement_accounts = [
+        retirement_account
+        for account in accounts
+        for retirement_account in account.get("retirement_accounts", [])
+    ]
 
     merged_account = {
         "account_number": primary_account_number,
@@ -951,6 +966,11 @@ def _merge_snapshots(
         "asset_value": _sum_values(accounts, "asset_value"),
         "account_value": _sum_values(accounts, "account_value"),
         "portfolio_value": _sum_values(accounts, "portfolio_value"),
+        "main_account_value": _sum_values(accounts, "main_account_value"),
+        "retirement_account_value": _sum_values(accounts, "retirement_account_value"),
+        "retirement_cash_balance": _sum_values(accounts, "retirement_cash_balance"),
+        "retirement_asset_value": _sum_values(accounts, "retirement_asset_value"),
+        "retirement_accounts": retirement_accounts,
         "profit_net": _sum_values(accounts, "profit_net"),
         "value_source": "aggregate",
         "accounts": accounts,
@@ -1055,6 +1075,8 @@ async def _snapshot(client: XTBClient) -> dict[str, Any]:
             account["portfolio_value"] = _rounded(cash_balance + asset_value)
             account["account_value"] = account["portfolio_value"]
             account["value_source"] = "cash_plus_assets"
+
+    await _apply_retirement_account_data(client, account)
 
     return {
         "account": account,
@@ -1189,6 +1211,404 @@ def _apply_close_price_data(
     data["daily_change_percent_source"] = "xcloseprice.close1day+tick.bid"
     data["daily_change_source"] = "xcloseprice.close1day+tick.bid"
     return data
+
+
+async def _apply_retirement_account_data(client: XTBClient, account: dict[str, Any]) -> None:
+    account_number = _int(account.get("account_number"))
+    session_file_raw = (
+        getattr(client, "_xtb_bridge_session_file", None)
+        or getattr(client, "session_file", None)
+    )
+    if account_number is None or not session_file_raw:
+        return
+
+    try:
+        retirement = await asyncio.to_thread(
+            _fetch_retirement_account_data_sync,
+            Path(session_file_raw),
+            account_number,
+        )
+    except Exception as err:  # noqa: BLE001 - this should never break normal xAPI snapshots
+        LOGGER.debug("Unable to fetch XTB retirement account data for %s: %s", account_number, err)
+        return
+
+    if not retirement:
+        return
+
+    _merge_retirement_account_data(account, retirement)
+
+
+def _merge_retirement_account_data(account: dict[str, Any], retirement: dict[str, Any]) -> bool:
+    retirement_value = _float(retirement.get("account_value"))
+    if retirement_value is None or retirement_value == 0:
+        return False
+
+    main_value = _first_present(
+        _float(account.get("main_account_value")),
+        _float(account.get("account_value")),
+        _float(account.get("portfolio_value")),
+        _float(account.get("side_bar_account_value")),
+        _float(account.get("total_equity")),
+    )
+    if main_value is None:
+        return False
+
+    account.setdefault("main_account_value", _rounded(main_value))
+    account.setdefault("main_portfolio_value", _rounded(_float(account.get("portfolio_value"))))
+    account.setdefault("main_side_bar_account_value", _rounded(_float(account.get("side_bar_account_value"))))
+    account["retirement_account_value"] = _rounded(retirement_value)
+    account["retirement_cash_balance"] = _rounded(_float(retirement.get("cash_balance")))
+    account["retirement_asset_value"] = _rounded(_float(retirement.get("asset_value")))
+    account["retirement_accounts"] = retirement.get("accounts") or []
+
+    combined_value = _rounded(main_value + retirement_value)
+    account["account_value"] = combined_value
+    account["portfolio_value"] = combined_value
+    account["side_bar_account_value"] = combined_value
+    account["value_source"] = "main_account_plus_retirement"
+
+    retirement_cash = _float(retirement.get("cash_balance"))
+    cash_balance = _float(account.get("cash_balance"))
+    if retirement_cash is not None and cash_balance is not None:
+        account["cash_balance"] = _rounded(cash_balance + retirement_cash)
+
+    retirement_assets = _float(retirement.get("asset_value"))
+    asset_value = _float(account.get("asset_value"))
+    if retirement_assets is not None and asset_value is not None:
+        account["asset_value"] = _rounded(asset_value + retirement_assets)
+
+    return True
+
+
+def _fetch_retirement_account_data_sync(
+    session_file: Path,
+    account_number: int,
+) -> dict[str, Any] | None:
+    tgt = _load_session_tgt(session_file)
+    if not tgt:
+        return None
+
+    person_token = _xstation_create_access_token(tgt)
+    person_accounts = _xstation_get_person_accounts(person_token)
+    person_account = next(
+        (account for account in person_accounts if _int(account.get("number")) == account_number),
+        None,
+    )
+    if not person_account:
+        return None
+
+    server_code = str(person_account.get("server") or "")
+    account_token = _xstation_create_access_token(tgt, account_number, server_code)
+    retire_accounts = _xstation_get_retirement_accounts(account_token)
+
+    balances: list[dict[str, Any]] = []
+    for retire_account in retire_accounts:
+        if retire_account.get("status") != RETIRE_ACCOUNT_STATUS_ON_REAL_CAN_ACCESS:
+            continue
+        details = retire_account.get("details") or {}
+        retire_account_id = _int(details.get("retire_account_id"))
+        retire_server_code = str(details.get("server_code") or "")
+        if retire_account_id is None or not retire_server_code:
+            continue
+
+        retire_token = _xstation_create_access_token(tgt, retire_account_id, retire_server_code)
+        balance = _xstation_get_retirement_balance(retire_token, _int(retire_account.get("type")))
+        if not balance or _float(balance.get("account_value")) is None:
+            continue
+
+        balances.append(
+            {
+                "type": retire_account.get("type"),
+                "type_name": _retirement_account_type_name(_int(retire_account.get("type"))),
+                "retire_account_id": retire_account_id,
+                "server_code": retire_server_code,
+                **balance,
+            }
+        )
+
+    if not balances:
+        return None
+
+    return {
+        "account_value": _sum_values(balances, "account_value"),
+        "cash_balance": _sum_values(balances, "cash_balance"),
+        "asset_value": _sum_values(balances, "asset_value"),
+        "accounts": balances,
+    }
+
+
+def _load_session_tgt(session_file: Path) -> str | None:
+    try:
+        data = json.loads(session_file.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return str(data.get("tgt") or "") or None
+
+
+def _xstation_create_access_token(
+    tgt: str,
+    account_number: int | None = None,
+    server_code: str | None = None,
+) -> str:
+    request_payload = _proto_field_string(1, tgt)
+    if account_number is not None and server_code:
+        account_payload = _proto_field_varint(1, account_number) + _proto_field_string(2, server_code)
+        request_payload += _proto_field_bytes(2, account_payload)
+
+    response = _grpc_web_unary(
+        "/pl.xtb.ipax.pub.grpc.auth.v2.AuthService/CreateAccessToken",
+        request_payload,
+    )
+    for field_number, wire_type, value in _proto_fields(response):
+        if field_number != 1 or wire_type != 2:
+            continue
+        for nested_number, nested_wire_type, nested_value in _proto_fields(value):
+            if nested_number == 1 and nested_wire_type == 2:
+                return nested_value.decode("utf-8")
+    raise RuntimeError("XTB CreateAccessToken did not return an access token")
+
+
+def _xstation_get_person_accounts(token: str) -> list[dict[str, Any]]:
+    response = _grpc_web_unary(
+        "/pl.xtb.ipax.pub.grpc.person.v1.PersonService/GetPerson",
+        b"",
+        token,
+    )
+    accounts: list[dict[str, Any]] = []
+    for field_number, wire_type, value in _proto_fields(response):
+        if field_number != 2 or wire_type != 2:
+            continue
+        account: dict[str, Any] = {}
+        for nested_number, nested_wire_type, nested_value in _proto_fields(value):
+            if nested_number == 1 and nested_wire_type == 0:
+                account["number"] = nested_value
+            elif nested_number == 2 and nested_wire_type == 2:
+                account["server"] = nested_value.decode("utf-8")
+            elif nested_number == 3 and nested_wire_type == 2:
+                account["currency"] = nested_value.decode("utf-8")
+            elif nested_number == 4 and nested_wire_type == 0:
+                account["expired"] = bool(nested_value)
+        accounts.append(account)
+    return accounts
+
+
+def _xstation_get_retirement_accounts(token: str) -> list[dict[str, Any]]:
+    response = _grpc_web_unary(
+        "/pl.xtb.ipax.pub.grpc.retirement.retireaccount.v1.MainAccountService/GetRetirementAccounts",
+        b"",
+        token,
+    )
+    accounts: list[dict[str, Any]] = []
+    for field_number, wire_type, value in _proto_fields(response):
+        if field_number != 1 or wire_type != 2:
+            continue
+        account: dict[str, Any] = {}
+        for nested_number, nested_wire_type, nested_value in _proto_fields(value):
+            if nested_number == 1 and nested_wire_type == 0:
+                account["type"] = nested_value
+            elif nested_number == 2 and nested_wire_type == 0:
+                account["status"] = nested_value
+            elif nested_number == 3 and nested_wire_type == 2:
+                details: dict[str, Any] = {}
+                for details_number, details_wire_type, details_value in _proto_fields(nested_value):
+                    if details_number == 1 and details_wire_type == 0:
+                        details["retire_account_id"] = details_value
+                    elif details_number == 2 and details_wire_type == 2:
+                        details["server_code"] = details_value.decode("utf-8")
+                account["details"] = details
+        accounts.append(account)
+    return accounts
+
+
+def _xstation_get_retirement_balance(
+    token: str,
+    account_type: int | None,
+) -> dict[str, Any] | None:
+    if account_type == RETIRE_ACCOUNT_TYPE_IKZE:
+        methods = ("GetIkzeWithdrawalData",)
+    elif account_type == RETIRE_ACCOUNT_TYPE_PEA:
+        methods = ("GetPEAWithdrawalData", "GetWithdrawalData")
+    elif account_type == RETIRE_ACCOUNT_TYPE_IKE:
+        methods = ("GetWithdrawalData",)
+    else:
+        methods = ("GetWithdrawalData", "GetIkzeWithdrawalData", "GetPEAWithdrawalData")
+
+    for method in methods:
+        try:
+            response = _grpc_web_unary(
+                f"/pl.xtb.ipax.pub.grpc.retirement.retireaccount.v1.RetireAccountService/{method}",
+                b"",
+                token,
+            )
+        except Exception as err:  # noqa: BLE001 - try the next compatible method
+            LOGGER.debug("Unable to fetch XTB retirement balance with %s: %s", method, err)
+            continue
+        balance = _parse_retirement_balance_response(response)
+        if balance:
+            balance["source"] = method
+            return balance
+    return None
+
+
+def _parse_retirement_balance_response(response: bytes) -> dict[str, Any] | None:
+    for field_number, wire_type, value in _proto_fields(response):
+        if field_number == 1 and wire_type == 2:
+            balance: dict[str, Any] = {}
+            for nested_number, nested_wire_type, nested_value in _proto_fields(value):
+                if nested_number == 1 and nested_wire_type == 0:
+                    balance["cash_balance"] = _money_from_xtb_amount(nested_value)
+                elif nested_number == 2 and nested_wire_type == 0:
+                    balance["asset_value"] = _money_from_xtb_amount(nested_value)
+                elif nested_number == 3 and nested_wire_type == 0:
+                    balance["account_value"] = _money_from_xtb_amount(nested_value)
+                elif nested_number == 4 and nested_wire_type == 2:
+                    balance["currency"] = nested_value.decode("utf-8")
+            return balance
+        if field_number == 2 and wire_type == 2:
+            LOGGER.debug("XTB retirement balance returned an error response")
+            return None
+    return None
+
+
+def _grpc_web_unary(path: str, message: bytes, token: str | None = None) -> bytes:
+    headers = {
+        "content-type": "application/grpc-web+proto",
+        "accept": "application/grpc-web+proto",
+        "x-grpc-web": "1",
+        "x-user-agent": "grpc-web-javascript/0.1",
+    }
+    if token:
+        headers["authorization"] = f"Bearer {token}"
+
+    request = urllib_request.Request(
+        f"{XTB_IPAX_API_URL}{path}",
+        data=_grpc_web_frame(message),
+        headers=headers,
+        method="POST",
+    )
+    try:
+        with urllib_request.urlopen(request, timeout=GRPC_WEB_TIMEOUT_SECONDS) as response:
+            raw_response = response.read()
+    except urllib_error.HTTPError as err:
+        err.read()
+        raise RuntimeError(f"XTB gRPC-web HTTP {err.code} for {path}") from err
+
+    data_frames, trailers = _grpc_web_parse_frames(raw_response)
+    grpc_status = _grpc_trailer_value(trailers, "grpc-status")
+    if grpc_status not in (None, "0"):
+        grpc_message = _grpc_trailer_value(trailers, "grpc-message") or "unknown error"
+        raise RuntimeError(f"XTB gRPC-web status {grpc_status} for {path}: {grpc_message}")
+    if not data_frames:
+        return b""
+    return data_frames[0]
+
+
+def _grpc_web_frame(message: bytes) -> bytes:
+    return b"\x00" + struct.pack(">I", len(message)) + message
+
+
+def _grpc_web_parse_frames(raw_response: bytes) -> tuple[list[bytes], list[bytes]]:
+    data_frames: list[bytes] = []
+    trailers: list[bytes] = []
+    position = 0
+    while position + 5 <= len(raw_response):
+        flag = raw_response[position]
+        length = struct.unpack(">I", raw_response[position + 1:position + 5])[0]
+        position += 5
+        payload = raw_response[position:position + length]
+        position += length
+        if flag & 0x80:
+            trailers.append(payload)
+        else:
+            data_frames.append(payload)
+    return data_frames, trailers
+
+
+def _grpc_trailer_value(trailers: list[bytes], key: str) -> str | None:
+    prefix = f"{key.lower()}:"
+    for trailer in trailers:
+        for line in trailer.decode("utf-8", errors="replace").splitlines():
+            if line.lower().startswith(prefix):
+                return line.split(":", 1)[1].strip()
+    return None
+
+
+def _proto_field_varint(field_number: int, value: int) -> bytes:
+    return _proto_varint((field_number << 3) | 0) + _proto_varint(value)
+
+
+def _proto_field_bytes(field_number: int, value: bytes) -> bytes:
+    return _proto_varint((field_number << 3) | 2) + _proto_varint(len(value)) + value
+
+
+def _proto_field_string(field_number: int, value: str) -> bytes:
+    return _proto_field_bytes(field_number, value.encode("utf-8"))
+
+
+def _proto_varint(value: int) -> bytes:
+    value = int(value)
+    encoded = bytearray()
+    while True:
+        byte = value & 0x7F
+        value >>= 7
+        if value:
+            encoded.append(byte | 0x80)
+        else:
+            encoded.append(byte)
+            return bytes(encoded)
+
+
+def _proto_fields(payload: bytes):
+    position = 0
+    while position < len(payload):
+        key, position = _proto_read_varint(payload, position)
+        field_number = key >> 3
+        wire_type = key & 7
+        if wire_type == 0:
+            value, position = _proto_read_varint(payload, position)
+            yield field_number, wire_type, value
+        elif wire_type == 1:
+            value = payload[position:position + 8]
+            position += 8
+            yield field_number, wire_type, value
+        elif wire_type == 2:
+            length, position = _proto_read_varint(payload, position)
+            value = payload[position:position + length]
+            position += length
+            yield field_number, wire_type, value
+        elif wire_type == 5:
+            value = payload[position:position + 4]
+            position += 4
+            yield field_number, wire_type, value
+        else:
+            raise ValueError(f"Unsupported protobuf wire type {wire_type}")
+
+
+def _proto_read_varint(payload: bytes, position: int) -> tuple[int, int]:
+    shift = 0
+    value = 0
+    while position < len(payload):
+        byte = payload[position]
+        position += 1
+        value |= (byte & 0x7F) << shift
+        if not byte & 0x80:
+            return value, position
+        shift += 7
+    raise ValueError("Truncated protobuf varint")
+
+
+def _money_from_xtb_amount(value: int | float | None) -> float | None:
+    if value is None:
+        return None
+    return _rounded(float(value) / 100)
+
+
+def _retirement_account_type_name(account_type: int | None) -> str:
+    return {
+        RETIRE_ACCOUNT_TYPE_IKE: "IKE",
+        RETIRE_ACCOUNT_TYPE_IKZE: "IKZE",
+        RETIRE_ACCOUNT_TYPE_PEA: "PEA",
+    }.get(account_type, "UNKNOWN")
 
 
 async def _fetch_instrument_info(client: XTBClient, symbol: str) -> dict[str, Any]:
@@ -1816,6 +2236,11 @@ def _build_summary(
         "side_bar_account_value": _rounded(_float(account.get("side_bar_account_value"))),
         "portfolio_value": _rounded(portfolio_value),
         "account_value": _rounded(portfolio_value),
+        "main_account_value": _rounded(_float(account.get("main_account_value"))),
+        "retirement_account_value": _rounded(_float(account.get("retirement_account_value"))),
+        "retirement_cash_balance": _rounded(_float(account.get("retirement_cash_balance"))),
+        "retirement_asset_value": _rounded(_float(account.get("retirement_asset_value"))),
+        "retirement_accounts": account.get("retirement_accounts") or [],
         "balance": _rounded(portfolio_value),
         "cash_balance": _rounded(cash_funds),
         "total_equity": _rounded(total_equity),
