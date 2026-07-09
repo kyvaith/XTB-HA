@@ -775,6 +775,7 @@ async def _discover_accounts(email: str, password: str) -> list[dict[str, Any]]:
     try:
         await probe.connect()
         accounts = _accounts_from_client(probe)
+        accounts = _enrich_accounts_with_person_accounts(accounts, _session_file(email, password))
         if not accounts:
             fallback = int(probe.ws.get_account_number())
             accounts = [
@@ -805,9 +806,47 @@ def _accounts_from_client(client: XTBClient) -> list[dict[str, Any]]:
                 "account_number": account_number,
                 "currency": str(getattr(account, "currency", "") or "").upper(),
                 "endpoint_type": str(getattr(account, "endpointType", "") or "").upper(),
+                "server_code": str(getattr(account, "serverCode", "") or "").strip(),
             }
         )
     return accounts
+
+
+def _enrich_accounts_with_person_accounts(
+    accounts: list[dict[str, Any]],
+    session_file: Path,
+) -> list[dict[str, Any]]:
+    if not accounts:
+        return accounts
+    try:
+        tgt = _load_session_tgt(session_file)
+        if not tgt:
+            return accounts
+        token = _xstation_create_access_token(tgt)
+        person_accounts = _xstation_get_person_accounts(token)
+    except Exception as err:  # noqa: BLE001 - account discovery can continue with xAPI metadata
+        LOGGER.debug("Unable to enrich XTB account list with PersonService: %s", err)
+        return accounts
+
+    person_accounts_by_number = {
+        _int(person_account.get("number")): person_account
+        for person_account in person_accounts
+        if _int(person_account.get("number")) is not None
+    }
+    enriched: list[dict[str, Any]] = []
+    for account in accounts:
+        account_number = _int(account.get("account_number"))
+        person_account = person_accounts_by_number.get(account_number)
+        if person_account:
+            account = {
+                **account,
+                "server_code": person_account.get("server") or account.get("server_code") or "",
+                "expired": person_account.get("expired", account.get("expired")),
+            }
+            if not account.get("currency") and person_account.get("currency"):
+                account["currency"] = str(person_account["currency"]).upper()
+        enriched.append(account)
+    return enriched
 
 
 def _select_account(
@@ -876,7 +915,10 @@ def _tracked_accounts(
 
 def _is_real_account(account: dict[str, Any]) -> bool:
     endpoint_type = str(account.get("endpoint_type") or "").upper()
-    return "DEMO" not in endpoint_type
+    server_code = str(account.get("server_code") or account.get("server") or "").upper()
+    if account.get("expired"):
+        return False
+    return "DEMO" not in endpoint_type and "DEMO" not in server_code
 
 
 async def _snapshot_for_accounts(
@@ -1719,6 +1761,7 @@ def _current_account_meta(client: XTBClient) -> dict[str, Any]:
     account_number = _int(getattr(client, "account_number", None))
     currency = ""
     endpoint_type = ""
+    server_code = ""
 
     login_result = client.ws.account_info
     if login_result:
@@ -1727,12 +1770,14 @@ def _current_account_meta(client: XTBClient) -> dict[str, Any]:
                 account_number = _int(getattr(account, "accountNo", None))
                 currency = str(getattr(account, "currency", "") or "").upper()
                 endpoint_type = str(getattr(account, "endpointType", "") or "").upper()
+                server_code = str(getattr(account, "serverCode", "") or "").strip()
                 break
 
     return {
         "account_number": account_number,
         "currency": currency,
         "endpoint_type": endpoint_type,
+        "server_code": server_code,
     }
 
 
@@ -1843,6 +1888,7 @@ def _normalize_account(raw: Any, meta: dict[str, Any]) -> dict[str, Any]:
         ),
         "currency": data.get("currency") or meta.get("currency") or "",
         "endpoint_type": meta.get("endpoint_type") or "",
+        "server_code": meta.get("server_code") or "",
         "value_source": value_source,
         "raw_numeric_balance_fields": _numeric_debug_fields(data),
     }

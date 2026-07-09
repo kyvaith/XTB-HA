@@ -67,8 +67,10 @@ bridge = _load_bridge()
 class BridgeRegressionTests(unittest.TestCase):
     def test_cfd_endpoint_type_is_treated_as_real_account(self) -> None:
         self.assertTrue(bridge._is_real_account({"endpoint_type": "CFD"}))
+        self.assertTrue(bridge._is_real_account({"endpoint_type": "CFD", "server_code": "XS-real1"}))
         self.assertTrue(bridge._is_real_account({"endpoint_type": "REAL"}))
         self.assertFalse(bridge._is_real_account({"endpoint_type": "DEMO"}))
+        self.assertFalse(bridge._is_real_account({"endpoint_type": "CFD", "server_code": "XS-demo1"}))
 
     def test_total_equity_is_account_value_not_profit_plus_equity(self) -> None:
         account = bridge._normalize_account(
