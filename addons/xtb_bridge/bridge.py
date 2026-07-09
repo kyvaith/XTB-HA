@@ -919,7 +919,7 @@ def _merge_snapshots(
     )
 
     accounts = [snapshot.get("account", {}) for snapshot in snapshots]
-    positions = _deduplicate_positions([
+    positions = _aggregate_positions([
         position
         for snapshot in snapshots
         for position in snapshot.get("positions", [])
@@ -1039,7 +1039,7 @@ async def _snapshot(client: XTBClient) -> dict[str, Any]:
             position["price_change"] = _rounded(price_change)
             position["price_change_percent"] = _rounded((price_change / open_price) * 100)
 
-    positions = _deduplicate_positions(positions)
+    positions = _aggregate_positions(positions)
 
     calculated_asset_value = sum(
         value
@@ -1336,6 +1336,8 @@ def _normalize_account(raw: Any, meta: dict[str, Any]) -> dict[str, Any]:
         "assetValue",
         "asset_value",
         "assetsValue",
+        "cashStockValue",
+        "cash_stock_value",
         "securitiesValue",
         "stockValue",
         "stocksValue",
@@ -1379,15 +1381,15 @@ def _normalize_account(raw: Any, meta: dict[str, Any]) -> dict[str, Any]:
         "floatingProfit",
     )
 
-    if portfolio_value is None and total_equity is not None and profit_net is not None:
-        portfolio_value = total_equity + profit_net
-        value_source = "total_equity_plus_net_profit"
     if portfolio_value is None and generic_value is not None:
         portfolio_value = generic_value
         value_source = "account_value"
     if portfolio_value is None and raw_portfolio_value is not None:
         portfolio_value = raw_portfolio_value
         value_source = "portfolio_value"
+    if portfolio_value is None and total_equity is not None:
+        portfolio_value = total_equity
+        value_source = "total_equity"
     if portfolio_value is None and cash_balance is not None and asset_value is not None:
         portfolio_value = cash_balance + asset_value
         value_source = "cash_plus_assets"
@@ -1535,13 +1537,13 @@ def _normalize_position(raw: Any, account: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _deduplicate_positions(positions: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Return one canonical dashboard position per instrument without summing duplicates."""
+def _aggregate_positions(positions: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Return one position per account and instrument, summing separate lots."""
     groups: dict[str, list[dict[str, Any]]] = {}
     for index, position in enumerate(positions):
         groups.setdefault(_position_group_key(position, index), []).append(position)
 
-    deduplicated: list[dict[str, Any]] = []
+    aggregated: list[dict[str, Any]] = []
     for grouped_positions in groups.values():
         canonical = dict(max(grouped_positions, key=_position_canonical_score))
         order_ids: list[Any] = []
@@ -1552,17 +1554,39 @@ def _deduplicate_positions(positions: list[dict[str, Any]]) -> list[dict[str, An
             _append_unique(account_numbers, position.get("account_number"))
             raw_keys.update(position.get("raw_keys") or [])
 
-        duplicate_count = len(grouped_positions)
-        canonical["deduplicated"] = duplicate_count > 1
-        canonical["duplicate_count"] = duplicate_count
-        canonical["position_count"] = duplicate_count
-        canonical["aggregated"] = False
+        position_count = len(grouped_positions)
+        for field in (
+            "volume",
+            "market_value",
+            "profit_loss",
+            "profit_net",
+            "swap",
+            "commission",
+            "margin",
+        ):
+            summed = _sum_values(grouped_positions, field)
+            if summed is not None:
+                canonical[field] = summed
+
+        market_value = _float(canonical.get("market_value"))
+        profit_loss = _float(canonical.get("profit_loss"))
+        if market_value is not None and profit_loss is not None:
+            cost_basis = market_value - profit_loss
+            if cost_basis:
+                profit_percent = _rounded((profit_loss / cost_basis) * 100)
+                canonical["profit_loss_percent"] = profit_percent
+                canonical["profit_percent"] = profit_percent
+
+        canonical["deduplicated"] = False
+        canonical["duplicate_count"] = position_count
+        canonical["position_count"] = position_count
+        canonical["aggregated"] = position_count > 1
         canonical["order_ids"] = order_ids
         canonical["account_numbers"] = account_numbers
         canonical["raw_keys"] = sorted(raw_keys)
-        deduplicated.append(canonical)
+        aggregated.append(canonical)
 
-    return deduplicated
+    return aggregated
 
 
 def _position_canonical_score(position: dict[str, Any]) -> tuple[float, float, float]:
@@ -1758,19 +1782,18 @@ def _build_summary(
     profit_net = _float(account.get("profit_net"))
     if profit_net is None and positions:
         profit_net = position_profit_net
-    total_equity_with_profit = (
-        total_equity + profit_net
-        if total_equity is not None and profit_net is not None
-        else None
-    )
     portfolio_value = _first_present(
-        total_equity_with_profit,
+        _float(account.get("side_bar_account_value")),
         _float(account.get("account_value")),
         _float(account.get("portfolio_value")),
+        total_equity,
     )
     value_source = account.get("value_source")
-    if total_equity_with_profit is not None:
-        value_source = "total_equity_plus_net_profit"
+    if portfolio_value == total_equity and total_equity is not None and value_source in (None, "equity_or_balance"):
+        value_source = "total_equity"
+    if portfolio_value is None and cash_funds is not None and asset_value is not None:
+        portfolio_value = cash_funds + asset_value
+        value_source = "cash_plus_assets"
     if portfolio_value is None:
         portfolio_value = equity if equity is not None else cash_funds
     profit_percent = _float(account.get("profit_percent"))

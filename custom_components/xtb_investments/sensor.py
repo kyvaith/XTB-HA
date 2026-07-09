@@ -371,26 +371,26 @@ def _account_value(data: XTBSnapshot) -> StateValue:
     cash_balance = _first_present(data.summary.get("cash_balance"), data.account.get("cash_balance"))
     asset_value = _first_present(data.summary.get("asset_value"), data.account.get("asset_value"))
     total_equity = _first_present(data.summary.get("total_equity"), data.account.get("total_equity"))
-    profit_net = _first_present(data.summary.get("profit_net"), data.account.get("profit_net"))
     calculated_value = None
     cash_balance_number = _as_float(cash_balance)
     asset_value_number = _as_float(asset_value)
     if cash_balance_number is not None and asset_value_number is not None:
         calculated_value = cash_balance_number + asset_value_number
-    total_equity_with_profit = None
-    total_equity_number = _as_float(total_equity)
-    profit_net_number = _as_float(profit_net)
-    if total_equity_number is not None and profit_net_number is not None:
-        total_equity_with_profit = total_equity_number + profit_net_number
+    value_source = _first_present(data.summary.get("value_source"), data.account.get("value_source"))
+    reported_values: tuple[Any, ...] = ()
+    if value_source != "total_equity_plus_net_profit":
+        reported_values = (
+            data.summary.get("account_value"),
+            data.summary.get("portfolio_value"),
+            data.account.get("account_value"),
+            data.account.get("portfolio_value"),
+        )
 
     return _first_present(
         data.summary.get("side_bar_account_value"),
         data.account.get("side_bar_account_value"),
-        total_equity_with_profit,
-        data.summary.get("account_value"),
-        data.summary.get("portfolio_value"),
-        data.account.get("account_value"),
-        data.account.get("portfolio_value"),
+        *reported_values,
+        total_equity,
         calculated_value,
         data.summary.get("equity"),
         data.account.get("equity"),
@@ -454,7 +454,7 @@ def _dashboard_rows(data: XTBSnapshot) -> str:
         return _as_float(value) or 0.0
 
     rows: list[str] = []
-    for position in sorted(data.positions, key=profit_value, reverse=True)[:10]:
+    for position in sorted(data.positions, key=profit_value, reverse=True)[:20]:
         profit = position.get("profit_loss")
         if profit is None:
             profit = position.get("profit_net")

@@ -52,6 +52,7 @@ class XTBInvestmentsCard extends HTMLElement {
 
     const attrs = state.attributes || {};
     const summary = attrs.summary || {};
+    const valueSource = summary.value_source || attrs.value_source;
     const positions = Array.isArray(attrs.positions) ? attrs.positions : [];
     const sortedPositions = [...positions].sort(
       (a, b) => this.positionProfit(b) - this.positionProfit(a)
@@ -59,9 +60,6 @@ class XTBInvestmentsCard extends HTMLElement {
     const orders = Array.isArray(attrs.orders) ? attrs.orders : [];
     const currency = summary.currency || attrs.unit_of_measurement || "";
     const totalEquity = this.asNumber(summary.total_equity);
-    const profitNet = this.asNumber(summary.profit_net);
-    const totalEquityWithProfit =
-      totalEquity !== undefined && profitNet !== undefined ? totalEquity + profitNet : undefined;
     const cashBalance = this.asNumber(summary.cash_balance);
     const assetValue = this.asNumber(summary.asset_value);
     const calculatedAccountValue =
@@ -70,9 +68,10 @@ class XTBInvestmentsCard extends HTMLElement {
         : undefined;
     const accountValue =
       summary.side_bar_account_value ??
-      totalEquityWithProfit ??
+      (valueSource === "total_equity_plus_net_profit" ? totalEquity : undefined) ??
       summary.account_value ??
       summary.portfolio_value ??
+      totalEquity ??
       calculatedAccountValue ??
       summary.balance ??
       state.state;
