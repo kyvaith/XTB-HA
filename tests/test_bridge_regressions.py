@@ -194,5 +194,45 @@ class BridgeRegressionTests(unittest.TestCase):
         self.assertEqual(account_two["profit_loss"], 40.0)
 
 
+class ConnectedClientFallbackTests(unittest.IsolatedAsyncioTestCase):
+    async def test_active_client_is_used_when_session_file_needs_refresh(self) -> None:
+        class RawClient:
+            is_connected = True
+            is_authenticated = True
+
+        class Managed:
+            email = "user@example.com"
+            password = "secret"
+            account_number = 123
+            client = RawClient()
+
+            async def get_snapshot(self):
+                return {
+                    "account": {"account_number": 123, "currency": "PLN", "account_value": 10},
+                    "summary": {"account_number": 123, "currency": "PLN", "account_value": 10},
+                    "positions": [],
+                    "orders": [],
+                    "quotes": {},
+                }
+
+        previous_clients = dict(bridge.CLIENTS)
+        try:
+            bridge.CLIENTS.clear()
+            bridge.CLIENTS["fake"] = Managed()
+
+            snapshot = await bridge._snapshot_from_connected_clients_if_refresh_risky(
+                "user@example.com",
+                "secret",
+                123,
+            )
+        finally:
+            bridge.CLIENTS.clear()
+            bridge.CLIENTS.update(previous_clients)
+
+        self.assertIsNotNone(snapshot)
+        self.assertEqual(snapshot["account"]["account_number"], 123)
+        self.assertEqual(snapshot["summary"]["account_value"], 10)
+
+
 if __name__ == "__main__":
     unittest.main()

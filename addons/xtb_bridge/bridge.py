@@ -40,6 +40,7 @@ DEFAULT_PORT = 8765
 PENDING_LOGIN_TTL_SECONDS = 300
 TGT_REFRESH_MARGIN_SECONDS = 5 * 60
 BROWSER_LOGIN_TIMEOUT_SECONDS = int(os.environ.get("XTB_BROWSER_LOGIN_TIMEOUT", "90"))
+TRUSTED_STATE_SETTLE_SECONDS = float(os.environ.get("XTB_TRUSTED_STATE_SETTLE_SECONDS", "8"))
 BROWSER_USER_AGENT = os.environ.get(
     "XTB_BROWSER_USER_AGENT",
     (
@@ -246,6 +247,11 @@ class ResilientBrowserCASAuth(BrowserCASAuth):
 
             LOGGER.info("Navigating trusted browser profile %s to %s", profile_dir, LOGIN_URL)
             await self._page.goto(LOGIN_URL, wait_until="commit", timeout=30_000)
+            await self._restore_tgt_from_context_cookies()
+            if self._tgt:
+                await self._persist_trusted_state()
+                await self.close()
+                return CASLoginSuccess(tgt=self._tgt, expires_at=time.time() + 8 * 3600)
 
             email_input = self._page.get_by_role("textbox").first
             try:
@@ -280,6 +286,7 @@ class ResilientBrowserCASAuth(BrowserCASAuth):
             await self._page.keyboard.type(password, delay=30)
 
             await self._page.wait_for_timeout(300)
+            await self._enable_trusted_device_options()
             await self._submit_login_form(password_input)
             LOGGER.info("Browser login form submitted")
 
@@ -334,6 +341,7 @@ class ResilientBrowserCASAuth(BrowserCASAuth):
             LOGGER.info("Submitting OTP code via browser")
             otp_input = await self._find_visible_otp_input(timeout_ms=30_000)
             await otp_input.fill(code)
+            await self._enable_trusted_device_options()
 
             button = self._page.get_by_role(
                 "button",
@@ -397,6 +405,19 @@ class ResilientBrowserCASAuth(BrowserCASAuth):
         except Exception as err:  # noqa: BLE001
             LOGGER.debug("Error intercepting browser response: %s", err)
 
+    async def _restore_tgt_from_context_cookies(self) -> None:
+        if not self._context:
+            return
+        with contextlib.suppress(Exception):
+            for cookie in await self._context.cookies():
+                if cookie.get("name") in {"CASTGT", "CASTGC"}:
+                    value = str(cookie.get("value") or "")
+                    if value.startswith("TGT-"):
+                        LOGGER.info("TGT restored from trusted browser cookie %s", cookie.get("name"))
+                        self._tgt = value
+                        self._tgt_event.set()
+                        return
+
     async def _submit_login_form(self, password_input) -> None:
         for name in ("Login", "Log in", "Sign in", "Zaloguj", "Zaloguj sie"):
             button = self._page.get_by_role("button", name=name)
@@ -445,6 +466,71 @@ class ResilientBrowserCASAuth(BrowserCASAuth):
             await asyncio.sleep(1)
         return None
 
+    async def _enable_trusted_device_options(self) -> None:
+        if not self._page:
+            return
+
+        patterns = re.compile(
+            r"(trusted|trust|remember|device|browser|zapami|zauf|urzadz|urząd|nie pytaj)",
+            re.I,
+        )
+        locators = [
+            self._page.get_by_role("checkbox", name=patterns),
+            self._page.get_by_role("switch", name=patterns),
+            self._page.locator("label").filter(has_text=patterns).locator("input[type='checkbox']"),
+        ]
+        for locator in locators:
+            with contextlib.suppress(Exception):
+                count = await locator.count()
+                for index in range(min(count, 5)):
+                    candidate = locator.nth(index)
+                    if not await candidate.is_visible(timeout=500):
+                        continue
+                    checked = False
+                    with contextlib.suppress(Exception):
+                        checked = await candidate.is_checked(timeout=500)
+                    if checked:
+                        continue
+                    await candidate.check(timeout=1000, force=True)
+                    LOGGER.info("Enabled trusted-device option on XTB login screen")
+                    return
+        await self._enable_trusted_checkbox_by_surrounding_text(patterns)
+
+    async def _enable_trusted_checkbox_by_surrounding_text(self, patterns: re.Pattern[str]) -> None:
+        if not self._page:
+            return
+        checkboxes = self._page.locator("input[type='checkbox']")
+        with contextlib.suppress(Exception):
+            count = await checkboxes.count()
+            for index in range(min(count, 8)):
+                candidate = checkboxes.nth(index)
+                text = await candidate.evaluate(
+                    """
+                    (el) => {
+                      const labels = [];
+                      if (el.id) {
+                        document.querySelectorAll(`label[for="${CSS.escape(el.id)}"]`)
+                          .forEach((label) => labels.push(label.innerText || label.textContent || ""));
+                      }
+                      const closestLabel = el.closest("label");
+                      if (closestLabel) labels.push(closestLabel.innerText || closestLabel.textContent || "");
+                      const parent = el.parentElement;
+                      if (parent) labels.push(parent.innerText || parent.textContent || "");
+                      return labels.join(" ");
+                    }
+                    """
+                )
+                if not patterns.search(str(text or "")):
+                    continue
+                checked = False
+                with contextlib.suppress(Exception):
+                    checked = await candidate.is_checked(timeout=500)
+                if checked:
+                    continue
+                await candidate.check(timeout=1000, force=True)
+                LOGGER.info("Enabled trusted-device option on XTB login screen")
+                return
+
     async def _find_visible_otp_input(self, *, timeout_ms: int):
         locators = [
             self._page.get_by_placeholder(re.compile(r"(otp|code|kod)", re.I)),
@@ -477,8 +563,24 @@ class ResilientBrowserCASAuth(BrowserCASAuth):
     async def _persist_trusted_state(self) -> None:
         if self._page:
             with contextlib.suppress(Exception):
-                await self._page.wait_for_timeout(1000)
+                await self._enable_trusted_device_options()
+            with contextlib.suppress(Exception):
+                await self._page.wait_for_load_state("networkidle", timeout=15_000)
+            with contextlib.suppress(Exception):
+                await self._page.wait_for_timeout(int(TRUSTED_STATE_SETTLE_SECONDS * 1000))
+        await self._restore_tgt_from_context_cookies()
+        with contextlib.suppress(Exception):
+            await self._persist_browser_storage_state()
         await self._persist_cas_cookies()
+
+    async def _persist_browser_storage_state(self) -> None:
+        if not self._context or not self._cookies_file:
+            return
+        browser_state_file = _browser_state_file_from_cookies_file(self._cookies_file)
+        browser_state_file.parent.mkdir(parents=True, exist_ok=True)
+        await self._context.storage_state(path=str(browser_state_file))
+        with contextlib.suppress(OSError):
+            browser_state_file.chmod(stat.S_IRUSR | stat.S_IWUSR)
 
     async def _persist_cas_cookies(self) -> None:
         if not self._context or not self._cookies_file:
@@ -644,6 +746,14 @@ async def snapshot(request: web.Request) -> web.Response:
         return web.json_response({"error": "Email and password are required"}, status=400)
 
     try:
+        cached_data = await _snapshot_from_connected_clients_if_refresh_risky(
+            email,
+            password,
+            account_number,
+        )
+        if cached_data is not None:
+            return web.json_response(cached_data)
+
         accounts = await _discover_accounts(email, password)
         selected_account = _select_account(accounts, requested_account_number=account_number)
         if selected_account is None:
@@ -663,12 +773,20 @@ async def snapshot(request: web.Request) -> web.Response:
             )
     except Exception as err:  # noqa: BLE001 - bridge must return actionable errors
         LOGGER.exception("Snapshot failed for %s", email)
-        await _close_clients_for(email, password)
         if _needs_reauth(err):
+            cached_data = await _snapshot_from_connected_clients(email, password, account_number)
+            if cached_data is not None:
+                LOGGER.warning(
+                    "Returning data from active XTB connection for %s after session refresh required OTP",
+                    email,
+                )
+                return web.json_response(cached_data)
+            await _close_clients_for(email, password)
             return web.json_response(
                 {"error": "XTB session expired. Reauthentication with a fresh OTP is required."},
                 status=428,
             )
+        await _close_clients_for(email, password)
         return web.json_response({"error": str(err)}, status=502)
 
     return web.json_response(data)
@@ -945,6 +1063,76 @@ async def _snapshot_for_accounts(
     if len(snapshots) == 1:
         return snapshots[0]
     return _merge_snapshots(snapshots, primary_account_number)
+
+
+async def _snapshot_from_connected_clients_if_refresh_risky(
+    email: str,
+    password: str,
+    account_number: int | None,
+) -> dict[str, Any] | None:
+    if _session_file_is_fresh(_session_file(email, password)):
+        return None
+    return await _snapshot_from_connected_clients(email, password, account_number)
+
+
+async def _snapshot_from_connected_clients(
+    email: str,
+    password: str,
+    account_number: int | None,
+) -> dict[str, Any] | None:
+    clients = _connected_clients_for(email, password, account_number)
+    if not clients:
+        return None
+
+    account_labels = ", ".join(str(client.account_number or "auto") for client in clients)
+    LOGGER.info(
+        "Using active XTB connection(s) for %s while cached TGT needs refresh: %s",
+        email,
+        account_labels,
+    )
+
+    snapshots: list[dict[str, Any]] = []
+    for client in clients:
+        snapshots.append(await client.get_snapshot())
+
+    if not snapshots:
+        return None
+    if len(snapshots) == 1:
+        return snapshots[0]
+
+    primary_account_number = (
+        account_number
+        if account_number is not None
+        else _int(snapshots[0].get("account", {}).get("account_number")) or 0
+    )
+    return _merge_snapshots(snapshots, primary_account_number)
+
+
+def _connected_clients_for(
+    email: str,
+    password: str,
+    account_number: int | None,
+) -> list[ManagedClient]:
+    clients: list[ManagedClient] = []
+    for client in CLIENTS.values():
+        if client.email != email or client.password != password:
+            continue
+        if account_number is not None and client.account_number != account_number:
+            continue
+        raw_client = client.client
+        if raw_client is None:
+            continue
+        if not getattr(raw_client, "is_connected", False) or not getattr(raw_client, "is_authenticated", False):
+            continue
+        clients.append(client)
+
+    clients.sort(
+        key=lambda client: (
+            0 if account_number is not None and client.account_number == account_number else 1,
+            client.account_number or 0,
+        )
+    )
+    return clients
 
 
 async def _close_clients_for(email: str, password: str) -> None:
@@ -2550,6 +2738,10 @@ def _client_key(email: str, password: str, account_number: int | None) -> str:
 
 def _cookies_file(email: str, password: str) -> Path:
     return SESSION_DIR / f"{_cache_key(email, password)}_cookies.json"
+
+
+def _browser_state_file_from_cookies_file(cookies_file: Path) -> Path:
+    return cookies_file.with_name(f"{cookies_file.stem}_browser_state.json")
 
 
 def _browser_profile_dir(email: str) -> Path:
