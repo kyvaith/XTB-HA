@@ -2600,7 +2600,7 @@ def _xtb_logo_url(symbol: str | None) -> str | None:
     slug = re.sub(r"[^a-z0-9]+", "_", str(symbol or "").lower()).strip("_")
     if not slug:
         return None
-    return f"https://logos.xtb.com/{slug}.png"
+    return f"https://logos.xtb.com/{slug}.svg"
 
 
 def _first_present(*values: Any) -> Any:

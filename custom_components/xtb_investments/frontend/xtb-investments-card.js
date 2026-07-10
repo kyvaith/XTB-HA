@@ -287,6 +287,7 @@ class XTBInvestmentsCard extends HTMLElement {
 
   instrumentMark(item) {
     const iconUrl = this.instrumentIconUrl(item);
+    const pngFallbackUrl = this.xtbLogoUrl(item.symbol, "png");
     const key = item.symbol || this.instrumentName(item);
     const avatarStyle = this.avatarStyle(key);
     const initials = this.escape(this.instrumentInitials(item));
@@ -294,7 +295,7 @@ class XTBInvestmentsCard extends HTMLElement {
       return `
         <span class="instrument-avatar image" style="${avatarStyle}" aria-hidden="true">
           <span class="instrument-fallback">${initials}</span>
-          <img src="${this.escape(iconUrl)}" alt="">
+          <img src="${this.escape(iconUrl)}" data-fallback-src="${this.escape(pngFallbackUrl)}" alt="">
         </span>
       `;
     }
@@ -321,18 +322,35 @@ class XTBInvestmentsCard extends HTMLElement {
       url.startsWith("/") ||
       url.startsWith("data:image/")
     ) {
-      return url;
+      return this.preferSvgXtbLogo(url);
     }
     return this.xtbLogoUrl(item.symbol);
   }
 
-  xtbLogoUrl(symbol) {
+  xtbLogoUrl(symbol, extension = "svg") {
     const slug = String(symbol || "")
       .trim()
       .toLowerCase()
       .replace(/[^a-z0-9]+/g, "_")
       .replace(/^_+|_+$/g, "");
-    return slug ? `https://logos.xtb.com/${slug}.png` : "";
+    const safeExtension = extension === "png" ? "png" : "svg";
+    return slug ? `https://logos.xtb.com/${slug}.${safeExtension}` : "";
+  }
+
+  preferSvgXtbLogo(url) {
+    try {
+      const parsed = new URL(url, window.location.origin);
+      if (
+        parsed.hostname === "logos.xtb.com" &&
+        parsed.pathname.toLowerCase().endsWith(".png")
+      ) {
+        parsed.pathname = parsed.pathname.replace(/\.png$/i, ".svg");
+        return parsed.toString();
+      }
+    } catch (_error) {
+      return url;
+    }
+    return url;
   }
 
   instrumentInitials(item) {
@@ -376,16 +394,24 @@ class XTBInvestmentsCard extends HTMLElement {
 
   attachImageFallbacks() {
     this.querySelectorAll(".instrument-avatar.image img").forEach((image) => {
-      image.addEventListener(
-        "error",
-        () => image.closest(".instrument-avatar")?.classList.add("image-error"),
-        { once: true }
-      );
-      image.addEventListener(
-        "load",
-        () => image.closest(".instrument-avatar")?.classList.add("image-loaded"),
-        { once: true }
-      );
+      image.addEventListener("error", () => {
+        const fallbackSrc = image.dataset.fallbackSrc;
+        if (
+          fallbackSrc &&
+          !image.dataset.fallbackTried &&
+          image.getAttribute("src") !== fallbackSrc
+        ) {
+          image.dataset.fallbackTried = "true";
+          image.src = fallbackSrc;
+          return;
+        }
+        image.closest(".instrument-avatar")?.classList.add("image-error");
+      });
+      image.addEventListener("load", () => {
+        const avatar = image.closest(".instrument-avatar");
+        avatar?.classList.add("image-loaded");
+        avatar?.classList.remove("image-error");
+      });
     });
   }
 
