@@ -106,13 +106,22 @@ class XTBBridgeSetupClient:
         self._hass = hass
         self._bridge_url = bridge_url.rstrip("/")
 
-    async def async_start_login(self, *, email: str, password: str) -> dict[str, Any]:
+    async def async_start_login(
+        self,
+        *,
+        email: str,
+        password: str,
+        source: str = "manual",
+        force_new_challenge: bool = False,
+    ) -> dict[str, Any]:
         """Start a login and return either success or an OTP challenge."""
         return await self._post(
             "/login/start",
             {
                 "email": email,
                 "password": password,
+                "source": source,
+                "force_new_challenge": force_new_challenge,
             },
         )
 

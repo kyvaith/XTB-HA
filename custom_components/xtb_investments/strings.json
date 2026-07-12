@@ -16,6 +16,10 @@
           "otp": "OTP code"
         }
       },
+      "reauth_confirm": {
+        "title": "Reconnect XTB",
+        "description": "The cached XTB session expired. Continue only when you are ready to start a new XTB login; XTB may send an OTP SMS after this step."
+      },
       "account": {
         "title": "XTB account",
         "description": "Choose the XTB account that Home Assistant should track.",

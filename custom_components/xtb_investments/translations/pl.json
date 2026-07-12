@@ -16,6 +16,10 @@
           "otp": "Kod OTP"
         }
       },
+      "reauth_confirm": {
+        "title": "Połącz ponownie z XTB",
+        "description": "Zapisana sesja XTB wygasła. Kontynuuj dopiero wtedy, gdy chcesz rozpocząć nowe logowanie do XTB; po tym kroku XTB może wysłać SMS z kodem OTP."
+      },
       "account": {
         "title": "Rachunek XTB",
         "description": "Wybierz rachunek XTB, który Home Assistant ma śledzić.",

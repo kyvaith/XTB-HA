@@ -33,7 +33,13 @@ def _install_bridge_dependency_stubs() -> None:
     sys.modules.setdefault("xtb_api.auth.cas_client", cas_client)
 
     exceptions = types.ModuleType("xtb_api.exceptions")
-    exceptions.CASError = type("CASError", (Exception,), {})
+
+    class CASError(Exception):
+        def __init__(self, code="", message=""):
+            super().__init__(message or code)
+            self.code = code
+
+    exceptions.CASError = CASError
     sys.modules.setdefault("xtb_api.exceptions", exceptions)
 
     enums = types.ModuleType("xtb_api.types.enums")
@@ -232,6 +238,37 @@ class ConnectedClientFallbackTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(snapshot)
         self.assertEqual(snapshot["account"]["account_number"], 123)
         self.assertEqual(snapshot["summary"]["account_value"], 10)
+
+
+class SessionRefreshSafetyTests(unittest.IsolatedAsyncioTestCase):
+    async def test_background_session_check_does_not_start_login_when_tgt_is_expired(self) -> None:
+        calls = 0
+
+        async def fail_if_called(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            raise AssertionError("background refresh must not start a password login")
+
+        original_fresh = bridge._session_file_is_fresh
+        original_login = bridge._login_with_fallback
+        try:
+            bridge._session_file_is_fresh = lambda path: False
+            bridge._login_with_fallback = fail_if_called
+
+            with self.assertRaises(bridge.CASError) as raised:
+                await bridge._ensure_session_ready("user@example.com", "secret")
+        finally:
+            bridge._session_file_is_fresh = original_fresh
+            bridge._login_with_fallback = original_login
+
+        self.assertEqual(calls, 0)
+        self.assertEqual(raised.exception.code, "AUTH_MANAGER_TGT_EXPIRED")
+
+    def test_automatic_login_sources_do_not_bypass_otp_retry_block(self) -> None:
+        self.assertFalse(bridge._login_source_allows_new_otp("reauth"))
+        self.assertFalse(bridge._login_source_allows_new_otp("snapshot"))
+        self.assertTrue(bridge._login_source_allows_new_otp("reauth_manual"))
+        self.assertTrue(bridge._login_source_allows_new_otp("otp_retry"))
 
 
 if __name__ == "__main__":

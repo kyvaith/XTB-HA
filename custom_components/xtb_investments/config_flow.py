@@ -53,7 +53,11 @@ class XTBInvestmentsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
             setup = XTBBridgeSetupClient(self.hass, bridge_url=self._bridge_url)
             try:
-                result = await setup.async_start_login(email=self._email, password=self._password)
+                result = await setup.async_start_login(
+                    email=self._email,
+                    password=self._password,
+                    source="initial",
+                )
             except XTBBridgeError:
                 errors["base"] = "cannot_connect"
             else:
@@ -122,11 +126,36 @@ class XTBInvestmentsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         self._password = entry_data[CONF_PASSWORD]
         self._bridge_url = entry_data.get(CONF_BRIDGE_URL, DEFAULT_BRIDGE_URL)
 
+        return await self.async_step_reauth_confirm()
+
+    async def async_step_reauth_confirm(
+        self,
+        user_input: dict[str, Any] | None = None,
+    ) -> config_entries.ConfigFlowResult:
+        """Ask the user before starting an XTB login that can send an OTP SMS."""
+        errors: dict[str, str] = {}
+
+        if user_input is None:
+            return self.async_show_form(
+                step_id="reauth_confirm",
+                data_schema=vol.Schema({}),
+                errors=errors,
+            )
+
         setup = XTBBridgeSetupClient(self.hass, bridge_url=self._bridge_url)
         try:
-            result = await setup.async_start_login(email=self._email, password=self._password)
+            result = await setup.async_start_login(
+                email=self._email,
+                password=self._password,
+                source="reauth_manual",
+            )
         except XTBBridgeError:
-            return self.async_abort(reason="cannot_connect")
+            errors["base"] = "cannot_connect"
+            return self.async_show_form(
+                step_id="reauth_confirm",
+                data_schema=vol.Schema({}),
+                errors=errors,
+            )
 
         return await self._handle_login_result(result, reauth=True)
 
@@ -185,7 +214,12 @@ class XTBInvestmentsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         """Start a fresh login when the previous OTP challenge expired."""
         setup = XTBBridgeSetupClient(self.hass, bridge_url=self._bridge_url)
         try:
-            result = await setup.async_start_login(email=self._email, password=self._password)
+            result = await setup.async_start_login(
+                email=self._email,
+                password=self._password,
+                source="otp_retry",
+                force_new_challenge=True,
+            )
         except XTBBridgeError:
             return self.async_show_form(
                 step_id="otp",
