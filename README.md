@@ -82,7 +82,7 @@ Config fields:
 - `email`: XTB login/email
 - `password`: XTB password
 
-If XTB sends an OTP after the password step, Home Assistant shows a second form for that one-time code. The OTP is not stored. If the OTP challenge expires before the code is submitted, the integration starts a fresh login attempt only after you submit the expired form again. Background polling and automatic reauth do not start a new password login by themselves, so the bridge should not generate OTP SMS messages while you are away. After a successful OTP login, the bridge keeps a persistent Playwright browser profile under the add-on `/data` directory so later browser logins can reuse the trusted browser state when XTB accepts it.
+If XTB sends an OTP after the password step, Home Assistant shows a second form for that one-time code. The OTP is not stored. If the OTP challenge expires before the code is submitted, the integration starts a fresh login attempt only after you submit the expired form again. Background polling and automatic reauth do not start a new password login by themselves, so the bridge should not generate OTP SMS messages while you are away. Before a cached TGT expires, the bridge tries to reconnect active xStation clients using the still-valid TGT so polling can continue on a fresh WebSocket without asking for OTP. After a successful OTP login, the bridge keeps a persistent Playwright browser profile under the add-on `/data` directory so later browser logins can reuse the trusted browser state when XTB accepts it.
 
 If XTB returns more than one account, Home Assistant shows an account selection step. Existing entries without a stored account number use the bridge default: prefer a real PLN account when present.
 
@@ -95,7 +95,7 @@ The card shows the account value, total monetary and percentage profit, the last
 If your dashboard is in YAML mode or HA blocks automatic resource writes, add this module resource manually:
 
 ```yaml
-url: /xtb_investments/xtb-investments-card.js?v=0.1.28
+url: /xtb_investments/xtb-investments-card.js?v=0.1.29
 type: module
 ```
 

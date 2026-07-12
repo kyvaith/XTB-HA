@@ -40,6 +40,9 @@ DEFAULT_PORT = 8765
 PENDING_LOGIN_TTL_SECONDS = 300
 OTP_RETRY_COOLDOWN_SECONDS = int(os.environ.get("XTB_OTP_RETRY_COOLDOWN_SECONDS", str(8 * 3600)))
 TGT_REFRESH_MARGIN_SECONDS = 5 * 60
+CLIENT_RECONNECT_BEFORE_TGT_EXPIRY_SECONDS = int(
+    os.environ.get("XTB_CLIENT_RECONNECT_BEFORE_TGT_EXPIRY_SECONDS", str(15 * 60))
+)
 BROWSER_LOGIN_TIMEOUT_SECONDS = int(os.environ.get("XTB_BROWSER_LOGIN_TIMEOUT", "90"))
 TRUSTED_STATE_SETTLE_SECONDS = float(os.environ.get("XTB_TRUSTED_STATE_SETTLE_SECONDS", "8"))
 BROWSER_USER_AGENT = os.environ.get(
@@ -98,6 +101,7 @@ class ManagedClient:
         self.client: XTBClient | None = None
         self.lock = asyncio.Lock()
         self.session_file = _session_file(email, password)
+        self._reconnected_for_tgt_expires_at: str | None = None
 
     async def get_snapshot(self) -> dict[str, Any]:
         async with self.lock:
@@ -105,8 +109,20 @@ class ManagedClient:
             return await _snapshot(client)
 
     async def _get_client(self) -> XTBClient:
+        reconnected_before_tgt_expiry = False
         if self.client and self.client.is_connected and self.client.is_authenticated:
-            return self.client
+            if not _should_reconnect_client_before_tgt_expiry(
+                self.session_file,
+                self._reconnected_for_tgt_expires_at,
+            ):
+                return self.client
+            LOGGER.info(
+                "Reconnecting active XTB client for %s account %s before cached TGT expires",
+                self.email,
+                self.account_number or "auto",
+            )
+            await self.close()
+            reconnected_before_tgt_expiry = True
 
         await self.close()
         if self.account_number is None:
@@ -122,6 +138,8 @@ class ManagedClient:
         )
         self.client._xtb_bridge_session_file = self.session_file
         await self.client.connect()
+        if reconnected_before_tgt_expiry:
+            self._reconnected_for_tgt_expires_at = _session_file_expires_at_iso(self.session_file)
         return self.client
 
     async def _discover_account_number(self) -> int:
@@ -2821,18 +2839,48 @@ def _clear_otp_retry_block(email: str, password: str) -> None:
         _otp_retry_file(email, password).unlink()
 
 
-def _session_file_is_fresh(path: Path) -> bool:
-    if not path.exists():
-        return False
-
+def _session_file_expires_at(path: Path) -> tuple[str, float] | None:
     try:
-        data = json.loads(path.read_text())
+        data = json.loads(path.read_text(encoding="utf-8"))
         tgt = str(data.get("tgt") or "")
-        expires_at = datetime.fromisoformat(str(data.get("expires_at") or "")).timestamp()
+        expires_at_iso = str(data.get("expires_at") or "")
+        expires_at = datetime.fromisoformat(expires_at_iso).timestamp()
     except (AttributeError, json.JSONDecodeError, OSError, ValueError):
+        return None
+
+    if not tgt or not expires_at_iso:
+        return None
+    return expires_at_iso, expires_at
+
+
+def _session_file_expires_at_iso(path: Path) -> str | None:
+    value = _session_file_expires_at(path)
+    return value[0] if value is not None else None
+
+
+def _should_reconnect_client_before_tgt_expiry(
+    path: Path,
+    reconnected_for_expires_at: str | None,
+) -> bool:
+    value = _session_file_expires_at(path)
+    if value is None:
         return False
 
-    return bool(tgt) and time.time() < (expires_at - TGT_REFRESH_MARGIN_SECONDS)
+    expires_at_iso, expires_at = value
+    seconds_left = expires_at - time.time()
+    return (
+        reconnected_for_expires_at != expires_at_iso
+        and TGT_REFRESH_MARGIN_SECONDS < seconds_left <= CLIENT_RECONNECT_BEFORE_TGT_EXPIRY_SECONDS
+    )
+
+
+def _session_file_is_fresh(path: Path) -> bool:
+    value = _session_file_expires_at(path)
+    if value is None:
+        return False
+
+    _, expires_at = value
+    return time.time() < (expires_at - TGT_REFRESH_MARGIN_SECONDS)
 
 
 async def _ensure_session_ready(

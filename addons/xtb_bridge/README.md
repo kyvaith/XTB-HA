@@ -4,7 +4,7 @@ This add-on runs the Chromium/Playwright part of the unofficial XTB login flow o
 
 It exposes a local HTTP API on port `8765`. The Home Assistant integration starts login with the XTB login and password. If XTB requires OTP, the add-on keeps the pending login challenge for a few minutes while Home Assistant asks the user for the current one-time code.
 
-Background polling does not start a fresh password login when the cached XTB TGT expires. New OTP challenges are created only after a manual Home Assistant login or reauthentication confirmation, which avoids overnight OTP SMS loops.
+Background polling does not start a fresh password login when the cached XTB TGT expires. New OTP challenges are created only after a manual Home Assistant login or reauthentication confirmation, which avoids overnight OTP SMS loops. Shortly before TGT expiry, the bridge reconnects active xStation clients with the still-valid TGT to keep the data WebSocket fresh without triggering OTP.
 
 After a successful OTP login, the add-on keeps a persistent Playwright browser profile in `/data/sessions/browser_profiles`. This lets later session refreshes reuse XTB's trusted-browser state instead of treating every refresh as a brand-new device.
 

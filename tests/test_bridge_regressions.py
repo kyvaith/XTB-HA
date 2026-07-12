@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
 import importlib.util
+import json
 from pathlib import Path
 import sys
+import tempfile
 import types
 import unittest
 
@@ -269,6 +272,34 @@ class SessionRefreshSafetyTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(bridge._login_source_allows_new_otp("snapshot"))
         self.assertTrue(bridge._login_source_allows_new_otp("reauth_manual"))
         self.assertTrue(bridge._login_source_allows_new_otp("otp_retry"))
+
+    def test_active_client_reconnects_once_before_tgt_enters_refresh_margin(self) -> None:
+        now = datetime(2026, 7, 12, 12, 0, tzinfo=UTC)
+        expires_at = (now + timedelta(minutes=10)).isoformat()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            session_file = Path(tmpdir) / "session.json"
+            session_file.write_text(
+                json.dumps({"tgt": "TGT-test", "expires_at": expires_at}),
+                encoding="utf-8",
+            )
+
+            original_time = bridge.time.time
+            try:
+                bridge.time.time = lambda: now.timestamp()
+                self.assertTrue(
+                    bridge._should_reconnect_client_before_tgt_expiry(session_file, None)
+                )
+                self.assertFalse(
+                    bridge._should_reconnect_client_before_tgt_expiry(session_file, expires_at)
+                )
+
+                bridge.time.time = lambda: (now + timedelta(minutes=6)).timestamp()
+                self.assertFalse(
+                    bridge._should_reconnect_client_before_tgt_expiry(session_file, None)
+                )
+            finally:
+                bridge.time.time = original_time
 
 
 if __name__ == "__main__":
