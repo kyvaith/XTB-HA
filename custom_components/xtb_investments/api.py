@@ -111,19 +111,20 @@ class XTBBridgeSetupClient:
         *,
         email: str,
         password: str,
+        account_number: int | None = None,
         source: str = "manual",
         force_new_challenge: bool = False,
     ) -> dict[str, Any]:
         """Start a login and return either success or an OTP challenge."""
-        return await self._post(
-            "/login/start",
-            {
-                "email": email,
-                "password": password,
-                "source": source,
-                "force_new_challenge": force_new_challenge,
-            },
-        )
+        payload: dict[str, Any] = {
+            "email": email,
+            "password": password,
+            "source": source,
+            "force_new_challenge": force_new_challenge,
+        }
+        if account_number is not None:
+            payload["account_number"] = account_number
+        return await self._post("/login/start", payload)
 
     async def async_complete_login(self, *, challenge_id: str, otp: str) -> dict[str, Any]:
         """Complete an OTP challenge."""

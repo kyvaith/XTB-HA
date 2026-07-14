@@ -105,8 +105,32 @@ class ManagedClient:
 
     async def get_snapshot(self) -> dict[str, Any]:
         async with self.lock:
-            client = await self._get_client()
-            return await _snapshot(client)
+            try:
+                client = await self._get_client()
+                return await _snapshot(client)
+            except Exception as err:
+                if not _is_connection_closed_error(err):
+                    raise
+
+                LOGGER.warning(
+                    "XTB WebSocket closed for %s account %s",
+                    self.email,
+                    self.account_number or "auto",
+                )
+                await self.close()
+                if _session_file_is_fresh(self.session_file):
+                    LOGGER.info(
+                        "Reconnecting XTB client for %s account %s after WebSocket close",
+                        self.email,
+                        self.account_number or "auto",
+                    )
+                    client = await self._get_client()
+                    return await _snapshot(client)
+
+                raise CASError(
+                    "AUTH_MANAGER_TGT_EXPIRED",
+                    "XTB WebSocket closed after cached TGT expired; manual reauthentication is required",
+                ) from err
 
     async def _get_client(self) -> XTBClient:
         reconnected_before_tgt_expiry = False
@@ -128,13 +152,18 @@ class ManagedClient:
         if self.account_number is None:
             self.account_number = await self._discover_account_number()
 
-        await _ensure_session_ready(self.email, self.password)
+        await _ensure_session_ready(
+            self.email,
+            self.password,
+            account_number=self.account_number,
+        )
         self.client = XTBClient(
             email=self.email,
             password=self.password,
             account_number=self.account_number,
             account_type="real",
             session_file=self.session_file,
+            auto_reconnect=False,
         )
         self.client._xtb_bridge_session_file = self.session_file
         await self.client.connect()
@@ -151,6 +180,7 @@ class ManagedClient:
             account_number=0,
             account_type="real",
             session_file=self.session_file,
+            auto_reconnect=False,
         )
         try:
             await probe.connect()
@@ -169,6 +199,13 @@ class ManagedClient:
             return
         try:
             await self.client.disconnect()
+        except Exception as err:  # noqa: BLE001 - stale sockets can fail while closing
+            LOGGER.debug(
+                "Ignoring XTB disconnect failure for %s account %s: %s",
+                self.email,
+                self.account_number or "auto",
+                err,
+            )
         finally:
             self.client = None
 
@@ -184,6 +221,7 @@ class PendingLogin:
     login_key: str
     email: str
     password: str
+    account_number: int | None
     cas: CASClient
     challenge: CASLoginTwoFactorRequired
     browser_auth: bool
@@ -668,13 +706,14 @@ async def login_start(request: web.Request) -> web.Response:
 
     email = str(payload.get("email") or "").strip()
     password = str(payload.get("password") or "")
+    account_number = _int(payload.get("account_number"))
     source = str(payload.get("source") or "manual").strip().lower()
     force_new_challenge = bool(payload.get("force_new_challenge"))
 
     if not email or not password:
         return web.json_response({"error": "Email and password are required"}, status=400)
 
-    login_key = _login_key(email, password)
+    login_key = _login_key(email, password, account_number)
     async with _login_lock(login_key):
         await _cleanup_pending_logins()
         pending_result = await _pending_login_for_key(login_key)
@@ -690,7 +729,7 @@ async def login_start(request: web.Request) -> web.Response:
             await _close_cas(pending.cas)
 
         if not _login_source_allows_new_otp(source):
-            retry_at = _otp_retry_blocked_until(email, password)
+            retry_at = _otp_retry_blocked_until(email, password, account_number)
             retry_after = max(1, int(retry_at - time.time())) if retry_at is not None else None
             LOGGER.warning(
                 "Suppressing automatic OTP login for %s from %s%s",
@@ -714,12 +753,13 @@ async def login_start(request: web.Request) -> web.Response:
                 status = 429
             return web.json_response(payload, status=status)
 
-        cas = _new_cas(email, password)
+        cas = _new_cas(email, password, account_number)
         try:
             result, browser_auth = await _login_with_fallback(
                 cas,
                 email,
                 password,
+                account_number=account_number,
                 prefer_browser_on_2fa=True,
             )
         except Exception as err:  # noqa: BLE001
@@ -730,6 +770,7 @@ async def login_start(request: web.Request) -> web.Response:
         return await _login_result_response(
             email=email,
             password=password,
+            account_number=account_number,
             cas=cas,
             result=result,
             browser_auth=browser_auth,
@@ -782,7 +823,12 @@ async def login_complete(request: web.Request) -> web.Response:
     if isinstance(result, CASLoginTwoFactorRequired):
         pending.challenge = result
         pending.expires_at = min(result.expires_at, time.time() + PENDING_LOGIN_TTL_SECONDS)
-        _mark_otp_retry_blocked(pending.email, pending.password, result.expires_at)
+        _mark_otp_retry_blocked(
+            pending.email,
+            pending.password,
+            pending.account_number,
+            result.expires_at,
+        )
         return _otp_required_response(challenge_id, result)
 
     async with PENDING_LOCK:
@@ -790,6 +836,7 @@ async def login_complete(request: web.Request) -> web.Response:
     return await _login_result_response(
         email=pending.email,
         password=pending.password,
+        account_number=pending.account_number,
         cas=pending.cas,
         result=result,
         browser_auth=False,
@@ -818,7 +865,7 @@ async def snapshot(request: web.Request) -> web.Response:
         if cached_data is not None:
             return web.json_response(cached_data)
 
-        accounts = await _discover_accounts(email, password)
+        accounts = await _discover_accounts(email, password, account_number=account_number)
         selected_account = _select_account(accounts, requested_account_number=account_number)
         if selected_account is None:
             key = _client_key(email, password, account_number)
@@ -860,19 +907,21 @@ async def _login_result_response(
     *,
     email: str,
     password: str,
+    account_number: int | None,
     cas: CASClient,
     result: CASLoginSuccess | CASLoginTwoFactorRequired,
     browser_auth: bool,
 ) -> web.Response:
     if isinstance(result, CASLoginTwoFactorRequired):
         challenge_id = secrets.token_urlsafe(24)
-        login_key = _login_key(email, password)
-        _mark_otp_retry_blocked(email, password, result.expires_at)
+        login_key = _login_key(email, password, account_number)
+        _mark_otp_retry_blocked(email, password, account_number, result.expires_at)
         async with PENDING_LOCK:
             PENDING_LOGINS[challenge_id] = PendingLogin(
                 login_key=login_key,
                 email=email,
                 password=password,
+                account_number=account_number,
                 cas=cas,
                 challenge=result,
                 browser_auth=browser_auth,
@@ -881,9 +930,9 @@ async def _login_result_response(
         return _otp_required_response(challenge_id, result)
 
     _save_session_file(_session_file(email, password), result.tgt, result.expires_at)
-    _clear_otp_retry_block(email, password)
+    _clear_otp_retry_block(email, password, account_number)
     try:
-        accounts = await _discover_accounts(email, password)
+        accounts = await _discover_accounts(email, password, account_number=account_number)
         account = _select_account(accounts)
         if account is None:
             raise RuntimeError("XTB login succeeded but no account number was returned")
@@ -916,47 +965,55 @@ async def _login_with_fallback(
     email: str,
     password: str,
     *,
+    account_number: int | None = None,
     prefer_browser_on_2fa: bool = False,
 ) -> tuple[CASLoginSuccess | CASLoginTwoFactorRequired, bool]:
     try:
         result = await cas.login(email, password)
         if prefer_browser_on_2fa and isinstance(result, CASLoginTwoFactorRequired):
             LOGGER.info("REST CAS login requires 2FA; trying trusted browser profile before prompting")
-            return await _login_with_browser(cas, email, password), True
+            return await _login_with_browser(cas, email, password, account_number), True
         return result, False
     except CASError as err:
         if "UNAUTHORIZED" in err.code:
             raise
         LOGGER.info("REST CAS login failed (%s), trying browser fallback", err.code)
-        return await _login_with_browser(cas, email, password), True
+        return await _login_with_browser(cas, email, password, account_number), True
     except Exception as err:
         LOGGER.info("REST CAS login failed (%s), trying browser fallback", err)
-        return await _login_with_browser(cas, email, password), True
+        return await _login_with_browser(cas, email, password, account_number), True
 
 
 async def _login_with_browser(
     cas: CASClient,
     email: str,
     password: str,
+    account_number: int | None = None,
 ) -> CASLoginSuccess | CASLoginTwoFactorRequired:
     cas._browser_auth = ResilientBrowserCASAuth(
         headless=True,
-        profile_dir=_browser_profile_dir(email),
-        cookies_file=_cookies_file(email, password),
+        profile_dir=_browser_profile_dir(email, account_number),
+        cookies_file=_cookies_file(email, password, account_number),
         user_agent=BROWSER_USER_AGENT,
-        device_fingerprint=_device_fingerprint(email),
+        device_fingerprint=_device_fingerprint(email, account_number),
     )
     return await cas._browser_auth.login(email, password)
 
 
-async def _discover_accounts(email: str, password: str) -> list[dict[str, Any]]:
-    await _ensure_session_ready(email, password)
+async def _discover_accounts(
+    email: str,
+    password: str,
+    *,
+    account_number: int | None = None,
+) -> list[dict[str, Any]]:
+    await _ensure_session_ready(email, password, account_number=account_number)
     probe = XTBClient(
         email=email,
         password=password,
         account_number=0,
         account_type="real",
         session_file=_session_file(email, password),
+        auto_reconnect=False,
     )
     try:
         await probe.connect()
@@ -2756,8 +2813,10 @@ def _session_file(email: str, password: str) -> Path:
     return SESSION_DIR / f"{_cache_key(email, password)}.json"
 
 
-def _login_key(email: str, password: str) -> str:
-    return _cache_key(email, password)
+def _login_key(email: str, password: str, account_number: int | None = None) -> str:
+    if account_number is None:
+        return _cache_key(email, password)
+    return _cache_key(email, password, str(account_number))
 
 
 def _login_lock(login_key: str) -> asyncio.Lock:
@@ -2791,12 +2850,16 @@ async def _pending_login_for_key(login_key: str) -> tuple[str, PendingLogin] | N
     return None
 
 
-def _otp_retry_file(email: str, password: str) -> Path:
-    return SESSION_DIR / f"{_cache_key(email, password)}_otp_retry.json"
+def _otp_retry_file(email: str, password: str, account_number: int | None = None) -> Path:
+    return SESSION_DIR / f"{_login_key(email, password, account_number)}_otp_retry.json"
 
 
-def _otp_retry_blocked_until(email: str, password: str) -> float | None:
-    path = _otp_retry_file(email, password)
+def _otp_retry_blocked_until(
+    email: str,
+    password: str,
+    account_number: int | None = None,
+) -> float | None:
+    path = _otp_retry_file(email, password, account_number)
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
         blocked_until = float(data.get("blocked_until") or 0)
@@ -2804,12 +2867,17 @@ def _otp_retry_blocked_until(email: str, password: str) -> float | None:
         return None
 
     if blocked_until <= time.time():
-        _clear_otp_retry_block(email, password)
+        _clear_otp_retry_block(email, password, account_number)
         return None
     return blocked_until
 
 
-def _mark_otp_retry_blocked(email: str, password: str, challenge_expires_at: float | None = None) -> None:
+def _mark_otp_retry_blocked(
+    email: str,
+    password: str,
+    account_number: int | None = None,
+    challenge_expires_at: float | None = None,
+) -> None:
     now = time.time()
     blocked_until = now + OTP_RETRY_COOLDOWN_SECONDS
     data = {
@@ -2820,7 +2888,7 @@ def _mark_otp_retry_blocked(email: str, password: str, challenge_expires_at: flo
     if challenge_expires_at:
         data["challenge_expires_at"] = datetime.fromtimestamp(challenge_expires_at, UTC).isoformat()
 
-    path = _otp_retry_file(email, password)
+    path = _otp_retry_file(email, password, account_number)
     path.parent.mkdir(parents=True, exist_ok=True)
     content = json.dumps(data, indent=2)
     fd = os.open(
@@ -2834,9 +2902,13 @@ def _mark_otp_retry_blocked(email: str, password: str, challenge_expires_at: flo
         os.close(fd)
 
 
-def _clear_otp_retry_block(email: str, password: str) -> None:
+def _clear_otp_retry_block(
+    email: str,
+    password: str,
+    account_number: int | None = None,
+) -> None:
     with contextlib.suppress(OSError):
-        _otp_retry_file(email, password).unlink()
+        _otp_retry_file(email, password, account_number).unlink()
 
 
 def _session_file_expires_at(path: Path) -> tuple[str, float] | None:
@@ -2887,6 +2959,7 @@ async def _ensure_session_ready(
     email: str,
     password: str,
     *,
+    account_number: int | None = None,
     allow_refresh: bool = False,
 ) -> None:
     session_file = _session_file(email, password)
@@ -2900,7 +2973,7 @@ async def _ensure_session_ready(
         )
 
     LOGGER.info("Cached XTB TGT is missing or expired for %s; refreshing before API connect", email)
-    login_key = _login_key(email, password)
+    login_key = _login_key(email, password, account_number)
     async with _login_lock(login_key):
         pending_result = await _pending_login_for_key(login_key)
         if pending_result is not None:
@@ -2909,23 +2982,24 @@ async def _ensure_session_ready(
                 "2FA is already required; waiting for the existing OTP challenge",
             )
 
-        cas = _new_cas(email, password)
+        cas = _new_cas(email, password, account_number)
         try:
             result, browser_auth = await _login_with_fallback(
                 cas,
                 email,
                 password,
+                account_number=account_number,
                 prefer_browser_on_2fa=True,
             )
             if isinstance(result, CASLoginTwoFactorRequired):
-                _mark_otp_retry_blocked(email, password, result.expires_at)
+                _mark_otp_retry_blocked(email, password, account_number, result.expires_at)
                 raise CASError(
                     "AUTH_MANAGER_2FA_NO_SECRET",
                     "2FA is required and the trusted browser profile did not bypass OTP",
                 )
 
             _save_session_file(session_file, result.tgt, result.expires_at)
-            _clear_otp_retry_block(email, password)
+            _clear_otp_retry_block(email, password, account_number)
             LOGGER.info(
                 "Refreshed XTB TGT for %s using %s",
                 email,
@@ -2939,20 +3013,25 @@ def _client_key(email: str, password: str, account_number: int | None) -> str:
     return _cache_key(email, password, str(account_number or "auto"))
 
 
-def _cookies_file(email: str, password: str) -> Path:
-    return SESSION_DIR / f"{_cache_key(email, password)}_cookies.json"
+def _cookies_file(email: str, password: str, account_number: int | None = None) -> Path:
+    return SESSION_DIR / f"{_login_key(email, password, account_number)}_cookies.json"
 
 
 def _browser_state_file_from_cookies_file(cookies_file: Path) -> Path:
     return cookies_file.with_name(f"{cookies_file.stem}_browser_state.json")
 
 
-def _browser_profile_dir(email: str) -> Path:
-    return SESSION_DIR / "browser_profiles" / _cache_key(email)
+def _browser_profile_dir(email: str, account_number: int | None = None) -> Path:
+    if account_number is None:
+        return SESSION_DIR / "browser_profiles" / _cache_key(email)
+    return SESSION_DIR / "browser_profiles" / _cache_key(email, str(account_number))
 
 
-def _device_fingerprint(email: str) -> str:
-    return hashlib.sha256(f"{email.lower()}|{BROWSER_USER_AGENT}".encode()).hexdigest().upper()
+def _device_fingerprint(email: str, account_number: int | None = None) -> str:
+    account_part = str(account_number or "default")
+    return hashlib.sha256(
+        f"{email.lower()}|{account_part}|{BROWSER_USER_AGENT}".encode()
+    ).hexdigest().upper()
 
 
 def _ensure_private_dir(path: Path) -> None:
@@ -2961,8 +3040,8 @@ def _ensure_private_dir(path: Path) -> None:
         path.chmod(stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR)
 
 
-def _new_cas(email: str, password: str) -> CASClient:
-    return CASClient(CASClientConfig(cookies_file=_cookies_file(email, password)))
+def _new_cas(email: str, password: str, account_number: int | None = None) -> CASClient:
+    return CASClient(CASClientConfig(cookies_file=_cookies_file(email, password, account_number)))
 
 
 def _save_session_file(path: Path, tgt: str, expires_at: float) -> None:
@@ -3009,6 +3088,26 @@ async def _close_cas(cas: CASClient) -> None:
             await browser_auth.close()
         cas._browser_auth = None
     await cas.aclose()
+
+
+def _is_connection_closed_error(err: Exception) -> bool:
+    seen: set[int] = set()
+    current: BaseException | None = err
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        name = type(current).__name__.lower()
+        text = str(current).lower()
+        if (
+            "connectionclosed" in name
+            or "xtbconnectionerror" in name
+            or "connection closed" in text
+            or "keepalive ping timeout" in text
+            or "timed out while closing connection" in text
+            or "no close frame received" in text
+        ):
+            return True
+        current = current.__cause__ or current.__context__
+    return False
 
 
 def _needs_reauth(err: Exception) -> bool:

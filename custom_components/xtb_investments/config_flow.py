@@ -125,6 +125,7 @@ class XTBInvestmentsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         self._email = entry_data[CONF_EMAIL]
         self._password = entry_data[CONF_PASSWORD]
         self._bridge_url = entry_data.get(CONF_BRIDGE_URL, DEFAULT_BRIDGE_URL)
+        self._account_number = _maybe_int(entry_data.get(CONF_ACCOUNT_NUMBER))
 
         return await self.async_step_reauth_confirm()
 
@@ -147,6 +148,7 @@ class XTBInvestmentsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             result = await setup.async_start_login(
                 email=self._email,
                 password=self._password,
+                account_number=self._account_number,
                 source="reauth_manual",
             )
         except XTBBridgeError:
@@ -217,6 +219,7 @@ class XTBInvestmentsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             result = await setup.async_start_login(
                 email=self._email,
                 password=self._password,
+                account_number=self._account_number,
                 source="otp_retry",
                 force_new_challenge=True,
             )

@@ -1,5 +1,5 @@
 name: XTB Bridge
-version: "0.1.29"
+version: "0.1.30"
 slug: xtb_bridge
 description: Local Chromium bridge for XTB Investments Home Assistant integration
 url: "https://github.com/kyvaith/XTB-HA/tree/main/addons/xtb_bridge"

@@ -301,6 +301,103 @@ class SessionRefreshSafetyTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 bridge.time.time = original_time
 
+    async def test_managed_client_disables_library_auto_reconnect(self) -> None:
+        created: list[dict] = []
+
+        class FakeXTBClient:
+            is_connected = False
+            is_authenticated = False
+
+            def __init__(self, **kwargs):
+                created.append(kwargs)
+
+            async def connect(self):
+                self.is_connected = True
+                self.is_authenticated = True
+
+            async def disconnect(self):
+                self.is_connected = False
+                self.is_authenticated = False
+
+        async def noop_session_ready(*args, **kwargs):
+            return None
+
+        async def fake_snapshot(client):
+            return {"session": {"connected": client.is_connected}}
+
+        original_client = bridge.XTBClient
+        original_ready = bridge._ensure_session_ready
+        original_snapshot = bridge._snapshot
+        try:
+            bridge.XTBClient = FakeXTBClient
+            bridge._ensure_session_ready = noop_session_ready
+            bridge._snapshot = fake_snapshot
+
+            client = bridge.ManagedClient(
+                email="user@example.com",
+                password="secret",
+                account_number=123,
+            )
+            snapshot = await client.get_snapshot()
+        finally:
+            bridge.XTBClient = original_client
+            bridge._ensure_session_ready = original_ready
+            bridge._snapshot = original_snapshot
+
+        self.assertEqual(snapshot["session"]["connected"], True)
+        self.assertEqual(created[0]["account_number"], 123)
+        self.assertFalse(created[0]["auto_reconnect"])
+
+    async def test_closed_websocket_after_expired_tgt_requires_reauth(self) -> None:
+        class RawClient:
+            is_connected = True
+            is_authenticated = True
+
+            async def disconnect(self):
+                self.is_connected = False
+                self.is_authenticated = False
+
+        async def closed_snapshot(_client):
+            raise RuntimeError("keepalive ping timeout; no close frame received")
+
+        original_snapshot = bridge._snapshot
+        original_fresh = bridge._session_file_is_fresh
+        try:
+            bridge._snapshot = closed_snapshot
+            bridge._session_file_is_fresh = lambda path: False
+            client = bridge.ManagedClient(
+                email="user@example.com",
+                password="secret",
+                account_number=123,
+            )
+            client.client = RawClient()
+
+            with self.assertRaises(bridge.CASError) as raised:
+                await client.get_snapshot()
+        finally:
+            bridge._snapshot = original_snapshot
+            bridge._session_file_is_fresh = original_fresh
+
+        self.assertEqual(raised.exception.code, "AUTH_MANAGER_TGT_EXPIRED")
+        self.assertIsNone(client.client)
+
+    def test_browser_profiles_are_scoped_by_account_when_available(self) -> None:
+        email = "user@example.com"
+        password = "secret"
+
+        self.assertNotEqual(
+            bridge._browser_profile_dir(email, 1),
+            bridge._browser_profile_dir(email, 2),
+        )
+        self.assertNotEqual(
+            bridge._cookies_file(email, password, 1),
+            bridge._cookies_file(email, password, 2),
+        )
+        self.assertNotEqual(
+            bridge._login_key(email, password, 1),
+            bridge._login_key(email, password, 2),
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
