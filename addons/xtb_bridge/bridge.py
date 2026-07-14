@@ -7,6 +7,7 @@ does that in its own container and exposes a small localhost API.
 from __future__ import annotations
 
 import asyncio
+import ast
 import contextlib
 from dataclasses import asdict, dataclass, is_dataclass
 from datetime import UTC, datetime
@@ -975,6 +976,11 @@ async def _login_with_fallback(
             return await _login_with_browser(cas, email, password, account_number), True
         return result, False
     except CASError as err:
+        if unexpected_2fa := _two_factor_required_from_unexpected_cas_response(err):
+            LOGGER.info(
+                "REST CAS login returned an unparsed 2FA challenge; prompting for OTP without browser fallback"
+            )
+            return unexpected_2fa, False
         if "UNAUTHORIZED" in err.code:
             raise
         LOGGER.info("REST CAS login failed (%s), trying browser fallback", err.code)
@@ -998,6 +1004,45 @@ async def _login_with_browser(
         device_fingerprint=_device_fingerprint(email, account_number),
     )
     return await cas._browser_auth.login(email, password)
+
+
+def _two_factor_required_from_unexpected_cas_response(
+    err: CASError,
+) -> CASLoginTwoFactorRequired | None:
+    if "CAS_UNEXPECTED_RESPONSE" not in err.code.upper():
+        return None
+
+    marker = "Unexpected login response:"
+    text = str(err)
+    if marker not in text or "TWO_FACTOR_REQUIRED" not in text:
+        return None
+
+    raw_payload = text.split(marker, 1)[1].strip()
+    try:
+        payload = ast.literal_eval(raw_payload)
+    except (SyntaxError, ValueError):
+        return None
+
+    if not isinstance(payload, dict) or payload.get("loginPhase") != "TWO_FACTOR_REQUIRED":
+        return None
+
+    login_ticket = _first_str(payload, "ticket", "loginTicket", "sessionId")
+    if not login_ticket:
+        return None
+
+    two_factor_type = _first_str(payload, "twoFactorAuthType", "two_factor_auth_type") or "SMS"
+    ttl = _float(payload.get("otpTimeToLive")) or OTP_WAIT_TIMEOUT
+    methods = payload.get("methods")
+    if not isinstance(methods, list) or not methods:
+        methods = [two_factor_type]
+
+    return CASLoginTwoFactorRequired(
+        login_ticket=login_ticket,
+        session_id=_first_str(payload, "sessionId", "session_id") or login_ticket,
+        two_factor_auth_type=two_factor_type,
+        methods=[str(method) for method in methods],
+        expires_at=time.time() + max(1, ttl),
+    )
 
 
 async def _discover_accounts(

@@ -54,8 +54,19 @@ def _install_bridge_dependency_stubs() -> None:
     sys.modules.setdefault("xtb_api.types.enums", enums)
 
     websocket = types.ModuleType("xtb_api.types.websocket")
-    websocket.CASLoginSuccess = type("CASLoginSuccess", (), {})
-    websocket.CASLoginTwoFactorRequired = type("CASLoginTwoFactorRequired", (), {})
+
+    class CASLoginSuccess:
+        def __init__(self, **kwargs):
+            for key, value in kwargs.items():
+                setattr(self, key, value)
+
+    class CASLoginTwoFactorRequired:
+        def __init__(self, **kwargs):
+            for key, value in kwargs.items():
+                setattr(self, key, value)
+
+    websocket.CASLoginSuccess = CASLoginSuccess
+    websocket.CASLoginTwoFactorRequired = CASLoginTwoFactorRequired
     sys.modules.setdefault("xtb_api.types.websocket", websocket)
 
 
@@ -397,6 +408,40 @@ class SessionRefreshSafetyTests(unittest.IsolatedAsyncioTestCase):
             bridge._login_key(email, password, 1),
             bridge._login_key(email, password, 2),
         )
+
+    async def test_unparsed_rest_2fa_response_prompts_without_browser_fallback(self) -> None:
+        class FakeCAS:
+            async def login(self, email, password):
+                raise bridge.CASError(
+                    "CAS_UNEXPECTED_RESPONSE",
+                    "Unexpected login response: "
+                    "{'success': True, 'loginPhase': 'TWO_FACTOR_REQUIRED', "
+                    "'ticket': 'MID-123', 'twoFactorAuthType': 'SMS', "
+                    "'otpTimeToLive': 300, 'otpTokenCount': 6}",
+                )
+
+        async def fail_browser_fallback(*args, **kwargs):
+            raise AssertionError("browser fallback must not run for an existing REST 2FA challenge")
+
+        original_browser = bridge._login_with_browser
+        try:
+            bridge._login_with_browser = fail_browser_fallback
+            result, browser_auth = await bridge._login_with_fallback(
+                FakeCAS(),
+                "user@example.com",
+                "secret",
+                account_number=123,
+                prefer_browser_on_2fa=True,
+            )
+        finally:
+            bridge._login_with_browser = original_browser
+
+        self.assertFalse(browser_auth)
+        self.assertIsInstance(result, bridge.CASLoginTwoFactorRequired)
+        self.assertEqual(result.login_ticket, "MID-123")
+        self.assertEqual(result.session_id, "MID-123")
+        self.assertEqual(result.two_factor_auth_type, "SMS")
+        self.assertEqual(result.methods, ["SMS"])
 
 
 if __name__ == "__main__":
