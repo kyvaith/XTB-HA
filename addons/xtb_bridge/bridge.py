@@ -58,6 +58,9 @@ BALANCE_SNAPSHOT_MAX_WAIT_MS = 3000
 CLOSE_PRICE_EID = 1005
 XTB_IPAX_API_URL = os.environ.get("XTB_IPAX_API_URL", "https://ipax.xtb.com").rstrip("/")
 GRPC_WEB_TIMEOUT_SECONDS = float(os.environ.get("XTB_GRPC_WEB_TIMEOUT", "20"))
+RETIREMENT_CACHE_MAX_AGE_SECONDS = int(
+    os.environ.get("XTB_RETIREMENT_CACHE_MAX_AGE_SECONDS", str(7 * 24 * 3600))
+)
 RETIRE_ACCOUNT_TYPE_IKE = 1
 RETIRE_ACCOUNT_TYPE_IKZE = 2
 RETIRE_ACCOUNT_TYPE_PEA = 4
@@ -1347,6 +1350,14 @@ def _merge_snapshots(
         for account in accounts
         for retirement_account in account.get("retirement_accounts", [])
     ]
+    retirement_cached_at = next(
+        (
+            account.get("retirement_data_cached_at")
+            for account in accounts
+            if account.get("retirement_data_cached_at")
+        ),
+        None,
+    )
 
     merged_account = {
         "account_number": primary_account_number,
@@ -1371,6 +1382,15 @@ def _merge_snapshots(
         "retirement_cash_balance": _sum_values(accounts, "retirement_cash_balance"),
         "retirement_asset_value": _sum_values(accounts, "retirement_asset_value"),
         "retirement_accounts": retirement_accounts,
+        "retirement_data_stale": any(bool(account.get("retirement_data_stale")) for account in accounts),
+        "retirement_data_cached_at": retirement_cached_at,
+        "retirement_value_source": (
+            "cached"
+            if any(account.get("retirement_value_source") == "cached" for account in accounts)
+            else "live"
+            if any(account.get("retirement_value_source") == "live" for account in accounts)
+            else None
+        ),
         "profit_net": _sum_values(accounts, "profit_net"),
         "value_source": "aggregate",
         "accounts": accounts,
@@ -1622,20 +1642,43 @@ async def _apply_retirement_account_data(client: XTBClient, account: dict[str, A
     if account_number is None or not session_file_raw:
         return
 
+    session_file = Path(session_file_raw)
+    retirement: dict[str, Any] | None = None
     try:
         retirement = await asyncio.to_thread(
             _fetch_retirement_account_data_sync,
-            Path(session_file_raw),
+            session_file,
             account_number,
         )
     except Exception as err:  # noqa: BLE001 - this should never break normal xAPI snapshots
-        LOGGER.debug("Unable to fetch XTB retirement account data for %s: %s", account_number, err)
+        LOGGER.warning(
+            "Unable to fetch live XTB retirement account data for %s; trying cached value: %s",
+            account_number,
+            err,
+        )
+
+    if retirement:
+        _save_retirement_account_cache(session_file, account_number, retirement)
+        if _merge_retirement_account_data(account, retirement):
+            account["retirement_data_stale"] = False
+            account["retirement_value_source"] = "live"
         return
 
-    if not retirement:
+    cached = _load_retirement_account_cache(session_file, account_number)
+    if not cached:
         return
 
-    _merge_retirement_account_data(account, retirement)
+    cached_retirement = cached["retirement"]
+    if _merge_retirement_account_data(account, cached_retirement):
+        account["retirement_data_stale"] = True
+        account["retirement_value_source"] = "cached"
+        account["retirement_data_cached_at"] = cached.get("cached_at_iso")
+        account["retirement_data_age_seconds"] = _rounded(_float(cached.get("age_seconds")))
+        LOGGER.warning(
+            "Using cached XTB retirement account data for %s from %s",
+            account_number,
+            cached.get("cached_at_iso") or "unknown time",
+        )
 
 
 def _merge_retirement_account_data(account: dict[str, Any], retirement: dict[str, Any]) -> bool:
@@ -1678,6 +1721,71 @@ def _merge_retirement_account_data(account: dict[str, Any], retirement: dict[str
         account["asset_value"] = _rounded(asset_value + retirement_assets)
 
     return True
+
+
+def _retirement_account_cache_file(session_file: Path, account_number: int) -> Path:
+    return session_file.with_name(f"{session_file.stem}_{account_number}_retirement.json")
+
+
+def _save_retirement_account_cache(
+    session_file: Path,
+    account_number: int,
+    retirement: dict[str, Any],
+) -> None:
+    now = time.time()
+    path = _retirement_account_cache_file(session_file, account_number)
+    data = {
+        "account_number": account_number,
+        "cached_at": now,
+        "cached_at_iso": datetime.fromtimestamp(now, UTC).isoformat(),
+        "retirement": retirement,
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    content = json.dumps(data, indent=2)
+    fd = os.open(
+        str(path),
+        os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
+        stat.S_IRUSR | stat.S_IWUSR,
+    )
+    try:
+        os.write(fd, content.encode())
+    finally:
+        os.close(fd)
+
+
+def _load_retirement_account_cache(
+    session_file: Path,
+    account_number: int,
+) -> dict[str, Any] | None:
+    path = _retirement_account_cache_file(session_file, account_number)
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+
+    retirement = data.get("retirement")
+    if not isinstance(retirement, dict):
+        return None
+
+    cached_at = _float(data.get("cached_at"))
+    if cached_at is None:
+        return None
+
+    age_seconds = max(0.0, time.time() - cached_at)
+    if age_seconds > RETIREMENT_CACHE_MAX_AGE_SECONDS:
+        LOGGER.warning(
+            "Ignoring stale XTB retirement cache for %s from %s",
+            account_number,
+            data.get("cached_at_iso") or "unknown time",
+        )
+        return None
+
+    return {
+        "retirement": retirement,
+        "cached_at": cached_at,
+        "cached_at_iso": data.get("cached_at_iso"),
+        "age_seconds": age_seconds,
+    }
 
 
 def _fetch_retirement_account_data_sync(
@@ -2645,6 +2753,10 @@ def _build_summary(
         "retirement_cash_balance": _rounded(_float(account.get("retirement_cash_balance"))),
         "retirement_asset_value": _rounded(_float(account.get("retirement_asset_value"))),
         "retirement_accounts": account.get("retirement_accounts") or [],
+        "retirement_data_stale": bool(account.get("retirement_data_stale")),
+        "retirement_data_cached_at": account.get("retirement_data_cached_at"),
+        "retirement_data_age_seconds": _rounded(_float(account.get("retirement_data_age_seconds"))),
+        "retirement_value_source": account.get("retirement_value_source"),
         "balance": _rounded(portfolio_value),
         "cash_balance": _rounded(cash_funds),
         "total_equity": _rounded(total_equity),

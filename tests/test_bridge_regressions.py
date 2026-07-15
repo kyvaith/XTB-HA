@@ -443,6 +443,55 @@ class SessionRefreshSafetyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.two_factor_auth_type, "SMS")
         self.assertEqual(result.methods, ["SMS"])
 
+    async def test_cached_retirement_data_is_used_when_live_fetch_fails(self) -> None:
+        now = datetime(2026, 7, 15, 12, 0, tzinfo=UTC)
+        retirement = {
+            "account_value": 20000.0,
+            "cash_balance": 1000.0,
+            "asset_value": 19000.0,
+            "accounts": [{"type_name": "IKZE", "account_value": 20000.0}],
+        }
+
+        class FakeClient:
+            pass
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            session_file = Path(tmpdir) / "session.json"
+            session_file.write_text(json.dumps({"tgt": "expired"}), encoding="utf-8")
+            FakeClient._xtb_bridge_session_file = session_file
+
+            original_time = bridge.time.time
+            original_fetch = bridge._fetch_retirement_account_data_sync
+            try:
+                bridge.time.time = lambda: now.timestamp()
+                bridge._save_retirement_account_cache(session_file, 53578037, retirement)
+
+                def fail_fetch(*args, **kwargs):
+                    raise RuntimeError("TGT expired")
+
+                bridge._fetch_retirement_account_data_sync = fail_fetch
+                account = bridge._normalize_account(
+                    {
+                        "balance": 2500.0,
+                        "cashStockValue": 7500.0,
+                        "totalEquity": 10000.0,
+                    },
+                    {"account_number": 53578037, "currency": "PLN"},
+                )
+
+                await bridge._apply_retirement_account_data(FakeClient(), account)
+            finally:
+                bridge.time.time = original_time
+                bridge._fetch_retirement_account_data_sync = original_fetch
+
+        self.assertEqual(account["main_account_value"], 10000.0)
+        self.assertEqual(account["retirement_account_value"], 20000.0)
+        self.assertEqual(account["account_value"], 30000.0)
+        self.assertEqual(account["value_source"], "main_account_plus_retirement")
+        self.assertTrue(account["retirement_data_stale"])
+        self.assertEqual(account["retirement_value_source"], "cached")
+        self.assertEqual(account["retirement_accounts"][0]["type_name"], "IKZE")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -8,4 +8,6 @@ Background polling does not start a fresh password login when the cached XTB TGT
 
 After a successful OTP login, the add-on keeps persistent Playwright browser profiles in `/data/sessions/browser_profiles`. Reauthentication for an existing Home Assistant entry includes the selected account number, so accounts can keep separate trusted-browser profiles when needed.
 
+Retirement account data, such as IKZE, uses a separate XTB endpoint. The add-on caches the last successful retirement balance for up to 7 days and uses it as a stale fallback when the trading WebSocket is still usable but the retirement endpoint cannot refresh.
+
 The add-on is read-only. It does not expose trading endpoints.
