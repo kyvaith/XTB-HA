@@ -234,6 +234,12 @@ class XTBQuoteSensor(XTBBaseSensor):
         return _change_percent_value(self.coordinator.data, self._symbol)
 
     @property
+    def icon(self) -> str:
+        if _change_percent_is_pending(self.coordinator.data, self._symbol):
+            return "mdi:timer-outline"
+        return "mdi:percent"
+
+    @property
     def available(self) -> bool:
         return super().available and self.native_value is not None
 
@@ -245,6 +251,7 @@ class XTBQuoteSensor(XTBBaseSensor):
             **quote,
             "name": _instrument_name(self.coordinator.data, self._symbol),
             "change_percent_source": _change_percent_source(self.coordinator.data, self._symbol),
+            "daily_change_status": _change_percent_status(self.coordinator.data, self._symbol),
             "position_profit_loss": position.get("profit_loss") if position else None,
             "position_market_value": position.get("market_value") if position else None,
             "currency": self.coordinator.data.summary.get("currency"),
@@ -302,6 +309,7 @@ class XTBPositionProfitSensor(XTBBaseSensor):
             "deduplicated": position.get("deduplicated"),
             "duplicate_count": position.get("duplicate_count"),
             "daily_change_percent": position.get("daily_change_percent"),
+            "daily_change_status": position.get("daily_change_status"),
             "profit_loss_percent": position.get("profit_loss_percent") or position.get("profit_percent"),
             "market_value": position.get("market_value"),
             "volume": position.get("volume"),
@@ -446,7 +454,7 @@ def _dashboard_summary(data: XTBSnapshot) -> str:
 
 
 def _dashboard_rows(data: XTBSnapshot) -> str:
-    """Return compact rows: name|daily_percent|profit;name|daily_percent|profit."""
+    """Return compact rows: name|daily_percent|profit|daily_status;..."""
     def profit_value(position: dict[str, Any]) -> float:
         value = position.get("profit_loss")
         if value is None:
@@ -464,6 +472,7 @@ def _dashboard_rows(data: XTBSnapshot) -> str:
                     _dashboard_text(_position_name(position) or "Position"),
                     _dashboard_number(position.get("daily_change_percent")),
                     _dashboard_number(profit),
+                    _dashboard_text(_daily_change_status(position)),
                 )
             )
         )
@@ -498,6 +507,33 @@ def _change_percent_source(data: XTBSnapshot, symbol: str) -> str | None:
     if quote.get("change_percent") is not None:
         return "quote_change_percent"
     return None
+
+
+def _change_percent_status(data: XTBSnapshot, symbol: str) -> str:
+    quote = data.quotes.get(symbol, {})
+    status = quote.get("daily_change_status")
+    if status:
+        return str(status)
+    return _daily_change_status(quote)
+
+
+def _change_percent_is_pending(data: XTBSnapshot, symbol: str) -> bool:
+    return _change_percent_status(data, symbol) == "pending"
+
+
+def _daily_change_status(item: dict[str, Any]) -> str:
+    status = item.get("daily_change_status")
+    if status:
+        return str(status)
+    value = _as_float(item.get("daily_change_percent"))
+    if value is None:
+        value = _as_float(item.get("change_percent"))
+    change = _as_float(item.get("daily_change"))
+    if value is None:
+        return "unavailable"
+    if abs(value) < 0.000001 and (change is None or abs(change) < 0.000001):
+        return "pending"
+    return "live"
 
 
 def _first_present(*values: Any) -> Any:

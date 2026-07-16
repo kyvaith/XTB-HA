@@ -213,6 +213,34 @@ class BridgeRegressionTests(unittest.TestCase):
         self.assertFalse(account_two["aggregated"])
         self.assertEqual(account_two["profit_loss"], 40.0)
 
+    def test_zero_daily_change_is_marked_as_pending(self) -> None:
+        quote = bridge._normalize_quote(
+            "SNDK.US",
+            {
+                "symbol": "SNDK.US",
+                "bid": 10.0,
+                "ask": 10.0,
+                "close1day": 10.0,
+            },
+        )
+
+        self.assertEqual(quote["daily_change_percent"], 0.0)
+        self.assertEqual(quote["daily_change_status"], "pending")
+
+    def test_non_zero_daily_change_is_marked_as_live(self) -> None:
+        quote = bridge._normalize_quote(
+            "SNDK.US",
+            {
+                "symbol": "SNDK.US",
+                "bid": 10.2,
+                "ask": 10.2,
+                "close1day": 10.0,
+            },
+        )
+
+        self.assertEqual(quote["daily_change_percent"], 2.0)
+        self.assertEqual(quote["daily_change_status"], "live")
+
 
 class ConnectedClientFallbackTests(unittest.IsolatedAsyncioTestCase):
     async def test_active_client_is_used_when_session_file_needs_refresh(self) -> None:

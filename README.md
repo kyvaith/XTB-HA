@@ -90,12 +90,12 @@ If XTB returns more than one account, Home Assistant shows an account selection 
 
 The integration registers `/xtb_investments/xtb-investments-card.js?v=<version>` as a JavaScript module resource automatically. Refresh the browser after updating the integration so the Home Assistant frontend reloads the card picker.
 
-The card shows the account value, total monetary and percentage profit, the last update time and a compact positions table. The top-right card header defaults to `XTB` and can be changed in the card editor or with the `header` YAML option. Separate lots for the same account and instrument are summed into one row, while different accounts remain separate. Positions are sorted from the largest to the smallest monetary profit/loss. Each instrument has a small rounded graphical marker using XTB logo URLs like `https://logos.xtb.com/asb_pl.svg`; if the SVG is unavailable, the card retries the matching PNG and then renders a deterministic ticker avatar. Card elements are clickable: the account value opens the account sensor history, the total profit opens the profit sensor when available, and instrument rows open the matching profit/loss entity history. The positions table intentionally shows only instrument name, daily percent change and monetary profit/loss; cash/free-funds metrics and the separate quotes table are omitted to keep the dashboard card dense.
+The card shows the account value, total monetary and percentage profit, the last update time and a compact positions table. The top-right card header defaults to `XTB` and can be changed in the card editor or with the `header` YAML option. Separate lots for the same account and instrument are summed into one row, while different accounts remain separate. Positions are sorted from the largest to the smallest monetary profit/loss. Each instrument has a small rounded graphical marker using XTB logo URLs like `https://logos.xtb.com/asb_pl.svg`; if the SVG is unavailable, the card retries the matching PNG and then renders a deterministic ticker avatar. Card elements are clickable: the account value opens the account sensor history, the total profit opens the profit sensor when available, and instrument rows open the matching profit/loss entity history. The positions table intentionally shows only instrument name, daily percent change and monetary profit/loss; cash/free-funds metrics and the separate quotes table are omitted to keep the dashboard card dense. When XTB reports a zero daily move before market open or while the market is closed, the card shows a timer icon instead of a misleading `0%`.
 
 If your dashboard is in YAML mode or HA blocks automatic resource writes, add this module resource manually:
 
 ```yaml
-url: /xtb_investments/xtb-investments-card.js?v=0.1.32
+url: /xtb_investments/xtb-investments-card.js?v=0.1.33
 type: module
 ```
 
@@ -119,7 +119,7 @@ The integration creates:
 - Free funds sensor
 - Profit sensor
 - Profit percent sensor
-- DeskHub sensor with compact `summary` and up to 20 sorted `rows` for ESPHome/e-paper clients
+- DeskHub sensor with compact `summary` and up to 20 sorted `rows` for ESPHome/e-paper clients; each row includes a daily-change status so constrained dashboards can render a timer icon for pending or closed markets
 - Open positions count sensor, disabled by default as a diagnostic entity
 - Pending orders count sensor, disabled by default as a diagnostic entity
 - Daily percent change sensors for instruments in the initial setup snapshot; values are calculated the same way as xStation5, from `xcloseprice.close1day` and the current tick bid. If XTB does not expose close-price data, the entity remains unavailable instead of showing position return.

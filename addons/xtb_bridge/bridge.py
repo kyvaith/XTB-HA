@@ -1469,6 +1469,8 @@ async def _snapshot(client: XTBClient) -> dict[str, Any]:
             position["daily_change_percent"] = quote.get("daily_change_percent")
         if position.get("daily_change") is None:
             position["daily_change"] = quote.get("daily_change")
+        if position.get("daily_change_status") in (None, "", "unavailable"):
+            position["daily_change_status"] = quote.get("daily_change_status")
         current_price = _float(position.get("current_price"))
         open_price = _float(position.get("open_price"))
         volume = _float(position.get("volume"))
@@ -2155,6 +2157,7 @@ async def _fetch_instrument_info(client: XTBClient, symbol: str) -> dict[str, An
         "previous": market_info.get("previous"),
         "daily_change": market_info.get("daily_change"),
         "daily_change_percent": market_info.get("daily_change_percent"),
+        "daily_change_status": market_info.get("daily_change_status"),
         "time": market_info.get("time"),
     }
 
@@ -2179,10 +2182,15 @@ def _apply_instrument_info(item: dict[str, Any], info: dict[str, Any] | None) ->
         "previous",
         "daily_change",
         "daily_change_percent",
+        "daily_change_status",
         "time",
     ):
         if item.get(key) in (None, "") and info.get(key) not in (None, ""):
             item[key] = info[key]
+    if item.get("daily_change_status") in (None, "", "unavailable") and info.get(
+        "daily_change_status"
+    ) not in (None, ""):
+        item["daily_change_status"] = info["daily_change_status"]
 
 
 def _quote_candidate_keys(symbol: str, symbol_key: str | None) -> list[str]:
@@ -2409,6 +2417,29 @@ def _normalize_position(raw: Any, account: dict[str, Any]) -> dict[str, Any]:
     volume = _first_float(data, "volume", "size", "amount") or 0.0
     if market_value is None and current_price is not None and volume:
         market_value = current_price * volume
+    daily_change = _first_float(
+        data,
+        "dailyChange",
+        "daily_change",
+        "dayChange",
+        "day_change",
+        "dailyPriceChange",
+        "dayPriceChange",
+        "todayChange",
+    )
+    daily_change_percent = _first_float(
+        data,
+        "dailyChangePercent",
+        "daily_change_percent",
+        "dayChangePercent",
+        "day_change_percent",
+        "dailyPercentageChange",
+        "dayPercentageChange",
+        "dailyChangePct",
+        "dayChangePct",
+        "todayChangePercent",
+        "todayChangePercentage",
+    )
 
     return {
         "symbol": symbol,
@@ -2422,33 +2453,9 @@ def _normalize_position(raw: Any, account: dict[str, Any]) -> dict[str, Any]:
         "open_price": open_price,
         "price_change": _rounded(price_change),
         "price_change_percent": _rounded(price_change_percent),
-        "daily_change": _rounded(
-            _first_float(
-                data,
-                "dailyChange",
-                "daily_change",
-                "dayChange",
-                "day_change",
-                "dailyPriceChange",
-                "dayPriceChange",
-                "todayChange",
-            )
-        ),
-        "daily_change_percent": _rounded(
-            _first_float(
-                data,
-                "dailyChangePercent",
-                "daily_change_percent",
-                "dayChangePercent",
-                "day_change_percent",
-                "dailyPercentageChange",
-                "dayPercentageChange",
-                "dailyChangePct",
-                "dayChangePct",
-                "todayChangePercent",
-                "todayChangePercentage",
-            )
-        ),
+        "daily_change": _rounded(daily_change),
+        "daily_change_percent": _rounded(daily_change_percent),
+        "daily_change_status": _daily_change_status(daily_change_percent, daily_change),
         "profit_loss": _rounded(profit_loss),
         "profit_loss_percent": _rounded(profit_loss_percent),
         "profit_net": _rounded(profit_loss),
@@ -2661,6 +2668,7 @@ def _normalize_quote(symbol: str, raw: Any) -> dict[str, Any]:
         "close_price": data.get("close_price") if isinstance(data.get("close_price"), dict) else None,
         "daily_change": _rounded(daily_change),
         "daily_change_percent": _rounded(daily_change_percent),
+        "daily_change_status": _daily_change_status(daily_change_percent, daily_change),
         "daily_change_source": _first_str(data, "daily_change_source", "dailyChangeSource"),
         "daily_change_percent_source": _first_str(
             data,
@@ -2670,6 +2678,19 @@ def _normalize_quote(symbol: str, raw: Any) -> dict[str, Any]:
         "time": _lookup_value(data, "timestamp") or _lookup_value(data, "time"),
         "raw_keys": sorted(data.keys()),
     }
+
+
+def _daily_change_status(
+    daily_change_percent: float | None,
+    daily_change: float | None = None,
+) -> str:
+    if daily_change_percent is None:
+        return "unavailable"
+    if abs(daily_change_percent) < 0.000001 and (
+        daily_change is None or abs(daily_change) < 0.000001
+    ):
+        return "pending"
+    return "live"
 
 
 def _normalize_session(client: XTBClient) -> dict[str, Any]:

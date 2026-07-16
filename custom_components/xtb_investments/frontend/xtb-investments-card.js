@@ -108,6 +108,7 @@ class XTBInvestmentsCard extends HTMLElement {
                   (position) => {
                     const positionProfit = this.positionProfit(position);
                     const positionEntityId = this.positionEntityId(position, currency);
+                    const dailyStatus = this.dailyChangeStatus(position);
                     return `
                       <tr${this.entityDataAttribute(positionEntityId)}>
                         <td class="strong">
@@ -116,8 +117,8 @@ class XTBInvestmentsCard extends HTMLElement {
                             <span class="instrument-name">${this.escape(this.instrumentName(position))}</span>
                           </div>
                         </td>
-                        <td class="${Number(position.daily_change_percent || 0) >= 0 ? "positive" : "negative"}">
-                          ${this.percent(position.daily_change_percent)}
+                        <td class="daily-cell ${dailyStatus === "pending" ? "pending" : Number(position.daily_change_percent || 0) >= 0 ? "positive" : "negative"}">
+                          ${this.dailyChangeContent(position, dailyStatus)}
                         </td>
                         <td class="pl-cell ${Number(positionProfit || 0) >= 0 ? "positive" : "negative"}">
                           <span>${this.money(positionProfit, currency)}</span>
@@ -493,6 +494,26 @@ class XTBInvestmentsCard extends HTMLElement {
     }).format(amount)}%`;
   }
 
+  dailyChangeStatus(item) {
+    const status = String(item?.daily_change_status || item?.dailyChangeStatus || "").toLowerCase();
+    if (status === "pending" || status === "closed" || status === "market_closed") {
+      return "pending";
+    }
+    const daily = Number(item?.daily_change_percent ?? item?.change_percent);
+    const change = Number(item?.daily_change ?? 0);
+    if (Number.isFinite(daily) && Math.abs(daily) < 0.000001 && Math.abs(change) < 0.000001) {
+      return "pending";
+    }
+    return "live";
+  }
+
+  dailyChangeContent(item, status = this.dailyChangeStatus(item)) {
+    if (status === "pending") {
+      return '<ha-icon class="market-timer" icon="mdi:timer-outline" title="Rynek zamknięty"></ha-icon>';
+    }
+    return this.percent(item?.daily_change_percent);
+  }
+
   asNumber(value) {
     const amount = Number(value);
     return Number.isFinite(amount) ? amount : undefined;
@@ -669,6 +690,21 @@ class XTBInvestmentsCard extends HTMLElement {
 
         tbody tr:last-child td {
           border-bottom: 0;
+        }
+
+        .daily-cell {
+          text-align: right;
+        }
+
+        .daily-cell.pending {
+          color: var(--secondary-text-color);
+        }
+
+        .market-timer {
+          --mdc-icon-size: 18px;
+          width: 18px;
+          height: 18px;
+          vertical-align: -4px;
         }
 
         th:first-child,
